@@ -1,6 +1,6 @@
-# claude-sdk-rs — Design Document
+# claude-code-agent: design notes
 
-> Source: the Claude Code 2.1.328 binary (its bundled JS chunks, cited as `chunk-*.js:line`), the official Python SDK (claude_agent_sdk 0.1.48), and live runs.
+> Source: the Claude Code binary (bundled JS chunks cited as `chunk-*.js:line` are from 2.1.328; the SDK is verified against 2.1.329), the official Python SDK (claude_agent_sdk 0.1.48), and live runs.
 > Claims carry a citation and a confidence label (HIGH/MEDIUM/LOW).
 
 ---
@@ -196,7 +196,7 @@ Set `ENABLE_TOOL_SEARCH=1` in subprocess env to activate. Distinct from Code Mod
 ## Architecture
 
 ```
-claude-sdk-rs/
+claude-code-agent/
 ├── src/
 │   ├── lib.rs
 │   ├── code_mode.rs     # patched CLI copy with Code Mode forced on, cached
@@ -212,7 +212,9 @@ claude-sdk-rs/
 │   ├── fs_events.rs     # FsEvent decoded from FileChanged/CwdChanged/DirectoryAdded
 │   └── middleware.rs    # ready-made hook policies (ToolAllowList)
 ├── claude-code-agent-macros/   # #[claude_tool] → <fn>_tool_def() + <fn>_tool()
-└── tests/               # integration_test.rs (live CLI, --ignored), replay_test.rs, macro_usage.rs
+├── scripts/             # cli-parity.py: SDK coverage of the installed CLI's flags and requests
+└── tests/               # integration_test.rs (live CLI, --ignored), replay_test.rs, macro_usage.rs,
+                         # process_tree.rs (close() ends the process tree; runs on every CI OS)
 ```
 
 ## Observability
@@ -239,6 +241,13 @@ holds frames since the previous `result` until its own echo arrives; a `result` 
 the echo closes another turn (a queued prompt, or one the CLI started itself after a
 background task finished) and the held frames are dropped.
 
+A prompt the CLI refuses before running it (for example over `max_budget_usd`) gets a
+`result` but no echo; that `result` lists the prompt in `user_message_uuids`, which also
+ends its stream. A prompt cancelled while queued gets neither: the CLI sends
+`command_lifecycle` with state `cancelled`, and the stream ends with
+`TurnErrorKind::Cancelled`. Dropping a stream before its end cancels its prompt
+(`cancel_async_message` if queued, otherwise `interrupt` for that prompt only).
+
 ## Lifecycle
 
 The CLI runs in its own process group (`process_group(0)`), so tools it starts (Bash,
@@ -246,7 +255,8 @@ background tasks) are in that group too. The Session owns the only strong stdin
 sender. `close()` closes stdin and waits up to 5 s for the CLI to exit; a CLI kept
 alive by background tasks then gets SIGTERM, then SIGKILL, sent to the whole group,
 and a final SIGTERM to the group ends leftover children. Dropping the last Session
-clone sends SIGTERM to the group if the CLI is still running.
+clone sends SIGTERM to the group if the CLI is still running. On Windows the same
+steps use `taskkill /T /F` on the CLI's process tree.
 
 ## Event fanout
 
@@ -255,6 +265,11 @@ channel. No frame is dropped for a slow consumer: a lost echo or `result` would 
 the turn. When stdout ends, all subscriber channels close and in-flight streams end
 with `Error`. Assistant frames with `parent_tool_use_id` belong to a subagent and are
 not turned into the parent turn's `AgentEvent`s.
+
+## Tool aliasing
+
+
+`chunk-hp1k7mph.js:69–70`: `gt = "Agent"`, `sf = "Task"` (`chunk-6r0zxzh1.js:3,15`). The init frame lists the tool `"Agent"` as `"Task"`. Custom aliases are set with `Initialize::tool_aliases`.
 
 ---
 
@@ -283,10 +298,6 @@ Source: `chunk-zhqawkqb.createDeviceHooksWorker.js`
 
 Protocol: `register_device_hooks` with `instance_id`, `hooks[]`, `templates[]`, `worker_epoch`.
 Lease: 300 s. Response: `status`, `lease_s`, `lease_expires_at`, `accepted`, `ignored`, `ignored_ids`, `replaced_owner`.
-
-### Tool aliasing
-
-`chunk-hp1k7mph.js:69–70`: `gt = "Agent"`, `sf = "Task"` (`chunk-6r0zxzh1.js:3,15`). The init frame lists the tool `"Agent"` as `"Task"`.
 
 ## Open Items
 

@@ -1,5 +1,5 @@
 //! Wire types for the Claude Code stream-json protocol.
-//! Source: the Claude Code 2.1.328 binary's zod schemas and the official
+//! Source: the Claude Code 2.1.329 binary's zod schemas and the official
 //! Python SDK (claude_agent_sdk 0.1.48); citations are on the types they cover.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 //
 // Wire format verified against the official Python SDK
 // (claude_agent_sdk 0.1.48, _internal/query.py:150–160, :238–375) and the
-// zod schemas inside the Claude Code 2.1.328 binary.
+// zod schemas inside the Claude Code 2.1.329 binary.
 
 /// Envelope for every host → CLI control request:
 /// `{"type":"control_request","request_id":"…","request":{"subtype":"…",…}}`.

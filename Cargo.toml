@@ -38,7 +38,6 @@ nix = { version = "0.32.0", features = ["signal"] }
 
 [dev-dependencies]
 tokio             = { version = "1", features = ["full"] }
-tokio-stream      = "0.1.19"
 anyhow            = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 claude-code-agent-macros = { version = "0.6.1", path = "claude-code-agent-macros" }

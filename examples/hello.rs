@@ -1,6 +1,6 @@
-/// Minimal example: spawn a session and prompt claude.
-///
-/// Run with: cargo run --example hello
+//! Minimal example: spawn a session, send one prompt, print the answer.
+//!
+//! Run: cargo run --example hello
 use claude_code_agent::{Agent, AgentEvent, Initialize, Session, SessionOptions};
 use std::path::PathBuf;
 use tokio_stream::StreamExt;

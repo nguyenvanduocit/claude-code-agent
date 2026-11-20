@@ -9,7 +9,7 @@
 //!
 //! Wire protocol verified against claude_agent_sdk 0.1.48
 //! (_internal/query.py, _internal/transport/subprocess_cli.py) and a live
-//! Claude Code 2.1.328 binary.
+//! Claude Code 2.1.329 binary.
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;

@@ -1,9 +1,9 @@
-//! **claude-code-agent** — Rust SDK for Claude Code.
+//! Run Claude Code from Rust.
 //!
-//! Drives the `claude` CLI (verified against 2.1.328) over its stream-json
-//! control protocol: one persistent process per session, Rust closures as
-//! hook callbacks and permission handlers, in-process tools over the SDK MCP
-//! bridge, record/replay, and a session pool.
+//! Each [`Session`] keeps one `claude` process running (Claude Code CLI
+//! 2.1.329 or newer). Send prompts with [`Agent`], approve or block tools with
+//! hooks and [`CanUseTool`], give Claude tools written in Rust, run many
+//! sessions with [`SessionPool`], and replay recorded sessions in tests.
 //!
 //! # Quick start
 //!
