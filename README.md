@@ -226,8 +226,8 @@ CLI 2.1.329 routes these kinds to an SDK host. The handler receives every kind t
 |---|---|---|---|
 | `auto_mode_server_fallback` | auto mode falls back to billed classifier requests (e.g. API key behind a gateway) | `"continue"` runs the classifier; `"interrupt"` and `cancelled()` reject the tool call and end the turn | yes |
 | `refusal_fallback_prompt` | a model refuses and a fallback model is set | `"retry_fallback"` retries on the fallback model; `"edit_prompt"` and `cancelled()` end the turn with the refusal | yes |
-| `fable_overage_consent_prompt` | a subscription reaches its Fable usage limit | per payload; an answer can turn on overage billing | no: needs a real account at its limit |
-| `send_to_project_remote_control_offer` | sending to another project needs Remote Control | `"turned_on"`, `"already_on"`, `"declined"`, `"failed"` | no: sends to a real project |
+| `fable_overage_consent_prompt` | a subscription reaches its Fable usage limit | per payload; an answer can turn on overage billing | no: a real account below its limit gets no dialog |
+| `send_to_project_remote_control_offer` | sending to another project needs Remote Control | `"turned_on"`, `"already_on"`, `"declined"`, `"failed"` | not sent to SDK sessions: 2.1.329 refuses `/send-to-project` there ("isn't available in this environment") |
 | `enum_prompt` | routed, but no flow in 2.1.329 sends it | per payload | not sent by 2.1.329 |
 
 `cancelled()` means the user dismissed the dialog; the CLI applies the dialog's default.
