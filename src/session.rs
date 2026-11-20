@@ -513,7 +513,7 @@ struct SessionInner {
     turns_in_flight: Arc<AtomicUsize>,
     /// `true` once the reader has handled the last stdout line.
     reader_done: watch::Receiver<bool>,
-    /// `close()` has ended the CLI's process group and its tools'.
+    /// `close()` has ended the CLI and what it started; `Drop` skips it.
     group_ended: AtomicBool,
     _tasks: [JoinHandle<()>; 3],
 }
@@ -1208,13 +1208,13 @@ impl Session {
         {
             groups.extend(pgid);
             blocking(move || end_groups(&groups)).await;
-            self.0.group_ended.store(true, Ordering::Release);
         }
         #[cfg(not(unix))]
         if exit.is_none() {
             kill_tree(self.0.pgid);
             exit = self.wait_exit(CLOSE_GRACE).await;
         }
+        self.0.group_ended.store(true, Ordering::Release);
         // Let the reader finish the last lines (and the recording).
         let mut done = self.0.reader_done.clone();
         let _ = tokio::time::timeout(CLOSE_GRACE, done.wait_for(|d| *d)).await;
@@ -1349,7 +1349,7 @@ impl Drop for SessionInner {
             }
         }
         #[cfg(not(unix))]
-        if self.state.load(Ordering::Acquire) != STATE_DEAD {
+        if !self.group_ended.load(Ordering::Acquire) && self.state.load(Ordering::Acquire) != STATE_DEAD {
             kill_tree(self.pgid);
         }
     }

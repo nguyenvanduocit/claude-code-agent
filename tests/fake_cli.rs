@@ -83,23 +83,20 @@ fn sleeper() -> std::process::Command {
 /// Start a child in the CLI's group and (Unix) one in a group of its own,
 /// write their pids, answer control requests, then outlive stdin EOF.
 fn tree_cli() {
-    let mut plain = sleeper().spawn().unwrap();
-    let mut pids = vec![plain.id()];
+    let mut children = vec![sleeper().spawn().unwrap()];
     #[cfg(unix)]
-    let mut detached = {
+    {
         use std::os::unix::process::CommandExt;
-        let child = sleeper().process_group(0).spawn().unwrap();
-        pids.push(child.id());
-        child
-    };
-    let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+        children.push(sleeper().process_group(0).spawn().unwrap());
+    }
+    let pids: Vec<String> = children.iter().map(|c| c.id().to_string()).collect();
     std::fs::write(std::env::var(PID_FILE).unwrap(), pids.join(" ")).unwrap();
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
         answer(&line);
     }
-    let _ = plain.wait();
-    #[cfg(unix)]
-    let _ = detached.wait();
+    for child in &mut children {
+        let _ = child.wait();
+    }
 }
 
 /// Session `sess-<WHO>` calls tool `slow` with JSON-RPC id 0 (as every CLI's
