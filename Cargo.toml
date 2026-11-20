@@ -1,0 +1,28 @@
+[package]
+name = "claude-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Full-protocol Rust SDK for Claude Code — persistent subprocess, 33 hooks, Code Mode, Workflow"
+license = "MIT"
+
+[features]
+default = []
+otel = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry"]
+
+[dependencies]
+tokio        = { version = "1", features = ["full"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+thiserror    = "1"
+tracing      = "0.1"
+dashmap      = "5"
+tokio-util   = { version = "0.7", features = ["codec"] }
+
+opentelemetry          = { version = "0.22", optional = true }
+opentelemetry-otlp     = { version = "0.15", optional = true }
+tracing-opentelemetry  = { version = "0.23", optional = true }
+tokio-stream = "0.1.19"
+async-stream = "0.3.6"
+
+[dev-dependencies]
+tokio-test = "0.4"
