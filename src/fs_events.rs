@@ -3,9 +3,9 @@
 //! Register a hook, then decode its payload:
 //!
 //! ```rust,no_run
-//! use claude_sdk::HookRegistry;
-//! use claude_sdk::fs_events::FsEvent;
-//! use claude_sdk::protocol::{HookEventKind, HookOutput};
+//! use claude_code_agent::HookRegistry;
+//! use claude_code_agent::fs_events::FsEvent;
+//! use claude_code_agent::protocol::{HookEventKind, HookOutput};
 //!
 //! let mut hooks = HookRegistry::new();
 //! hooks.on(HookEventKind::CwdChanged, None, |payload| async move {

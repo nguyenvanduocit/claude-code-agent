@@ -2,7 +2,7 @@
 //! (useful for deterministic tests of code built on the SDK).
 //!
 //! Run: cargo run --example record_replay
-use claude_sdk::{replay, Agent, AgentEvent, Initialize, Session, SessionOptions};
+use claude_code_agent::{replay, Agent, AgentEvent, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 async fn ask(agent: &Agent, prompt: &str) -> anyhow::Result<(String, Option<f64>)> {
@@ -21,7 +21,7 @@ async fn ask(agent: &Agent, prompt: &str) -> anyhow::Result<(String, Option<f64>
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let path = std::env::temp_dir().join("claude-sdk-example.jsonl");
+    let path = std::env::temp_dir().join("claude-code-agent-example.jsonl");
 
     let live = Session::spawn(
         SessionOptions { record: Some(path.clone()), ..Default::default() },

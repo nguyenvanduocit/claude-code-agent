@@ -3,8 +3,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use claude_sdk::protocol::{HookEventKind, HookOutput, PermissionMode, ToolDecision};
-use claude_sdk::{
+use claude_code_agent::protocol::{HookEventKind, HookOutput, PermissionMode, ToolDecision};
+use claude_code_agent::{
     Agent, AgentEvent, CanUseTool, HookRegistry, Initialize, SdkMcpServer, Session, SessionOptions,
     TurnResult,
 };
@@ -45,7 +45,7 @@ async fn prompt_round_trip() {
 #[tokio::test]
 #[ignore = "requires a real claude binary and valid credentials"]
 async fn hook_and_permission_callbacks_gate_tools() {
-    let dir = std::env::temp_dir().join(format!("claude-sdk-e2e-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("claude-code-agent-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let marker = dir.join("marker.txt");
 
@@ -125,7 +125,7 @@ async fn close_and_reconnect_keeps_transcript() {
 }
 
 /// Look up a secret only this process knows, so the answer proves the tool ran.
-#[claude_sdk_macros::claude_tool]
+#[claude_code_agent_macros::claude_tool]
 async fn vault_lookup(key: String) -> Result<String, String> {
     match key.as_str() {
         "launch" => Ok("ZEBRA-7731".into()),
@@ -175,7 +175,7 @@ async fn compact_with_instructions() {
     let agent = Agent::new(session);
     turn(&agent, "Remember the codeword OSPREY-9. Reply only: ok").await;
 
-    let mut stream = claude_sdk::compaction::compact(&agent, Some("keep the codeword"))
+    let mut stream = claude_code_agent::compaction::compact(&agent, Some("keep the codeword"))
         .await
         .expect("compact");
     let mut compacted = None;
@@ -202,13 +202,13 @@ async fn compact_with_instructions() {
 #[tokio::test]
 #[ignore = "requires a real claude binary and valid credentials"]
 async fn record_then_replay() {
-    let path = std::env::temp_dir().join(format!("claude-sdk-rec-{}.jsonl", std::process::id()));
+    let path = std::env::temp_dir().join(format!("claude-code-agent-rec-{}.jsonl", std::process::id()));
     let opts = SessionOptions { record: Some(path.clone()), ..Default::default() };
     let live = Session::spawn(opts, Initialize::default()).await.expect("spawn");
     let (live_text, _, live_result) = turn(&Agent::new(live.clone()), "Reply with exactly: replay works").await;
     live.close().await;
 
-    let replayed = claude_sdk::replay::replay(&path, SessionOptions::default()).await.expect("replay");
+    let replayed = claude_code_agent::replay::replay(&path, SessionOptions::default()).await.expect("replay");
     assert_eq!(replayed.initialize_response(), live.initialize_response());
     let agent = Agent::new(replayed);
     let (text, _, result) = turn(&agent, "anything").await;
@@ -256,7 +256,7 @@ async fn concurrent_prompts_get_their_own_turns() {
     let agent = Agent::new(session);
     let s1 = agent.prompt("Reply with exactly: alpha").await.expect("send 1");
     let s2 = agent.prompt("Reply with exactly: bravo").await.expect("send 2");
-    let collect = |mut s: claude_sdk::agent::AgentStream| async move {
+    let collect = |mut s: claude_code_agent::agent::AgentStream| async move {
         let mut text = String::new();
         while let Some(ev) = s.next().await {
             match ev {
@@ -315,7 +315,7 @@ async fn api_error_ends_turn_with_error() {
     }
     let error = outcome.expect("no result").expect("turn reported Done");
     eprintln!("error={error:?}");
-    assert_eq!(error.kind, claude_sdk::protocol::TurnErrorKind::Api);
+    assert_eq!(error.kind, claude_code_agent::protocol::TurnErrorKind::Api);
     assert!(error.message.contains("claude-nonexistent-9"), "{error}");
 }
 

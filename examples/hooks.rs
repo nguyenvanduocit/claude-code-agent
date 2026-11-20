@@ -5,9 +5,9 @@
 //!   - ToolAllowList: block every tool except Read/Bash/Glob
 //!
 //! Run: cargo run --example hooks
-use claude_sdk::middleware::ToolAllowList;
-use claude_sdk::protocol::{HookEventKind, HookOutput};
-use claude_sdk::{Agent, AgentEvent, HookRegistry, Initialize, Session, SessionOptions};
+use claude_code_agent::middleware::ToolAllowList;
+use claude_code_agent::protocol::{HookEventKind, HookOutput};
+use claude_code_agent::{Agent, AgentEvent, HookRegistry, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 #[tokio::main]

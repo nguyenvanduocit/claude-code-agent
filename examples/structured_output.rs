@@ -1,7 +1,7 @@
 //! Structured output: the turn's answer as JSON matching a schema.
 //!
 //! Run: cargo run --example structured_output
-use claude_sdk::{Agent, AgentEvent, Initialize, Session, SessionOptions};
+use claude_code_agent::{Agent, AgentEvent, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 #[tokio::main]

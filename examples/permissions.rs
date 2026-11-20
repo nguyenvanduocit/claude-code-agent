@@ -3,8 +3,8 @@
 //! Read-only commands (ls, uname, …) never ask, so the demo uses `mkdir`.
 //!
 //! Run: cargo run --example permissions
-use claude_sdk::protocol::{PermissionMode, ToolDecision};
-use claude_sdk::{Agent, AgentEvent, CanUseTool, Initialize, Session, SessionOptions};
+use claude_code_agent::protocol::{PermissionMode, ToolDecision};
+use claude_code_agent::{Agent, AgentEvent, CanUseTool, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 #[tokio::main]

@@ -2,8 +2,8 @@
 //! snapshots of the task tree (AgentEvent::BackgroundTasks → TaskTree).
 //!
 //! Run: cargo run --example background
-use claude_sdk::background::TaskTree;
-use claude_sdk::{Agent, AgentEvent, Initialize, Session, SessionOptions};
+use claude_code_agent::background::TaskTree;
+use claude_code_agent::{Agent, AgentEvent, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 #[tokio::main]

@@ -2,7 +2,7 @@
 //! starts on its own when a background command finishes.
 //!
 //! Run: cargo run --example watch
-use claude_sdk::{Agent, AgentEvent, Initialize, PermissionMode, Session, SessionOptions};
+use claude_code_agent::{Agent, AgentEvent, Initialize, PermissionMode, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 fn show(prefix: &str, ev: &AgentEvent) {

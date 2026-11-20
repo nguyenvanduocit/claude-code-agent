@@ -159,7 +159,7 @@ never get the `REPL` tool. The check also refuses:
    pointer zeroed, Bun compiles the patched source.
 4. On macOS, re-sign ad hoc with the stock entitlements (JIT). Without them the
    modified binary is killed.
-5. Cache the copy in `~/.cache/claude-sdk/code-mode/<name>-<size>-<mtime>-sdk<version>/claude`
+5. Cache the copy in `~/.cache/claude-code-agent/code-mode/<name>-<size>-<mtime>-sdk<version>/claude`
    (`$XDG_CACHE_HOME` when set). The first spawn takes about 6 s; later spawns reuse
    the copy, and a CLI update or a new SDK version builds a new one. Each build
    records its source path; a build whose source CLI changed or is gone is deleted,
@@ -211,7 +211,7 @@ claude-sdk-rs/
 │   ├── background.rs    # TaskTree over background_tasks_changed snapshots
 │   ├── fs_events.rs     # FsEvent decoded from FileChanged/CwdChanged/DirectoryAdded
 │   └── middleware.rs    # ready-made hook policies (ToolAllowList)
-├── claude-sdk-macros/   # #[claude_tool] → <fn>_tool_def() + <fn>_tool()
+├── claude-code-agent-macros/   # #[claude_tool] → <fn>_tool_def() + <fn>_tool()
 └── tests/               # integration_test.rs (live CLI, --ignored), replay_test.rs, macro_usage.rs
 ```
 

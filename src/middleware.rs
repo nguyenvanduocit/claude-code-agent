@@ -5,8 +5,8 @@ use crate::protocol::{HookEventKind, HookOutput};
 /// Block every tool call whose tool is not in the list (PreToolUse hook).
 ///
 /// ```rust,no_run
-/// use claude_sdk::HookRegistry;
-/// use claude_sdk::middleware::ToolAllowList;
+/// use claude_code_agent::HookRegistry;
+/// use claude_code_agent::middleware::ToolAllowList;
 ///
 /// let mut hooks = HookRegistry::new();
 /// ToolAllowList::new(["Read", "Grep", "Glob"]).install(&mut hooks);

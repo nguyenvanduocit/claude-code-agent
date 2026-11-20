@@ -2,7 +2,7 @@
 //! in a new process with Session::reconnect.
 //!
 //! Run: cargo run --example multi_turn
-use claude_sdk::{Agent, AgentEvent, Initialize, Session, SessionOptions};
+use claude_code_agent::{Agent, AgentEvent, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 async fn ask(agent: &Agent, prompt: &str) -> anyhow::Result<String> {

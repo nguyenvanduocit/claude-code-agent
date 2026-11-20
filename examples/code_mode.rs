@@ -1,9 +1,9 @@
 //! Code Mode: Claude gets the `REPL` tool and works by writing JavaScript
 //! that calls its tools. The SDK runs a patched copy of the CLI (built once,
-//! cached under ~/.cache/claude-sdk/code-mode/).
+//! cached under ~/.cache/claude-code-agent/code-mode/).
 //!
 //! Run: cargo run --example code_mode
-use claude_sdk::{Agent, AgentEvent, Initialize, Session, SessionOptions};
+use claude_code_agent::{Agent, AgentEvent, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 #[tokio::main]

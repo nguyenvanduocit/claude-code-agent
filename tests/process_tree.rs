@@ -6,7 +6,7 @@
 use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
 
-use claude_sdk::{Initialize, Session, SessionOptions};
+use claude_code_agent::{Initialize, Session, SessionOptions};
 
 const ROLE: &str = "CLAUDE_SDK_TEST_ROLE";
 const CHILD_PID_FILE: &str = "CLAUDE_SDK_TEST_CHILD_PID_FILE";
@@ -33,7 +33,7 @@ fn fake_cli() {
             continue;
         }
         let payload = match msg["request"]["subtype"].as_str() {
-            Some("get_binary_version") => serde_json::json!({ "version": claude_sdk::session::MIN_CLI_VERSION }),
+            Some("get_binary_version") => serde_json::json!({ "version": claude_code_agent::session::MIN_CLI_VERSION }),
             _ => serde_json::json!({}),
         };
         let reply = serde_json::json!({
@@ -48,7 +48,7 @@ fn fake_cli() {
 }
 
 fn close_ends_process_tree() {
-    let pid_file = std::env::temp_dir().join(format!("claude-sdk-tree-{}.pid", std::process::id()));
+    let pid_file = std::env::temp_dir().join(format!("claude-code-agent-tree-{}.pid", std::process::id()));
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (cli_pid, child_pid) = rt.block_on(async {
         let opts = SessionOptions {

@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use claude_sdk::protocol::{HookEventKind, HookOutput, PermissionMode};
-use claude_sdk::{compaction, Agent, AgentEvent, HookRegistry, Initialize, Session, SessionOptions};
+use claude_code_agent::protocol::{HookEventKind, HookOutput, PermissionMode};
+use claude_code_agent::{compaction, Agent, AgentEvent, HookRegistry, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 const ALL: [HookEventKind; 33] = {
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let dir = std::env::temp_dir().join("claude-sdk-hook-coverage");
+    let dir = std::env::temp_dir().join("claude-code-agent-hook-coverage");
     std::fs::create_dir_all(dir.join("sub"))?;
     let opts = SessionOptions {
         hooks,

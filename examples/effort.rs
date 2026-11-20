@@ -1,8 +1,8 @@
 //! Start a session at one model and effort level, then switch both mid-session.
 //!
 //! Run: cargo run --example effort
-use claude_sdk::protocol::Effort;
-use claude_sdk::{Agent, AgentEvent, Initialize, Session, SessionOptions};
+use claude_code_agent::protocol::Effort;
+use claude_code_agent::{Agent, AgentEvent, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 async fn ask(agent: &Agent, prompt: &str) -> anyhow::Result<()> {

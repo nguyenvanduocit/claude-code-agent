@@ -1,12 +1,12 @@
-/// Compile-checks that #[claude_tool] output integrates with claude_sdk::protocol::ToolDef.
+/// Compile-checks that #[claude_tool] output integrates with claude_code_agent::protocol::ToolDef.
 ///
 /// This is an integration test run with: cargo test --features macros
-/// It confirms the generated <name>_tool_def() returns claude_sdk::protocol::ToolDef.
+/// It confirms the generated <name>_tool_def() returns claude_code_agent::protocol::ToolDef.
 #[cfg(feature = "macros")]
 mod macro_integration {
     #![allow(unused_variables, dead_code)]
-    use claude_sdk::protocol::ToolDef;
-    use claude_sdk_macros::claude_tool;
+    use claude_code_agent::protocol::ToolDef;
+    use claude_code_agent_macros::claude_tool;
 
     /// List files in a directory
     #[claude_tool]
@@ -22,7 +22,7 @@ mod macro_integration {
 
     #[test]
     fn tool_def_is_correct_type() {
-        // Generated fn returns the real claude_sdk::protocol::ToolDef.
+        // Generated fn returns the real claude_code_agent::protocol::ToolDef.
         let def: ToolDef = list_files_tool_def();
         assert_eq!(def.name, "list_files");
         assert_eq!(def.description, "List files in a directory");
@@ -62,7 +62,7 @@ mod macro_integration {
         format!("hello {name}")
     }
 
-    async fn call(server: &claude_sdk::SdkMcpServer, tool: &str, args: serde_json::Value) -> serde_json::Value {
+    async fn call(server: &claude_code_agent::SdkMcpServer, tool: &str, args: serde_json::Value) -> serde_json::Value {
         let msg = serde_json::json!({
             "jsonrpc": "2.0", "id": 7, "method": "tools/call",
             "params": { "name": tool, "arguments": args },
@@ -72,7 +72,7 @@ mod macro_integration {
 
     #[tokio::test]
     async fn generated_handler_decodes_args_and_maps_results() {
-        let server = claude_sdk::SdkMcpServer::new("t").tool(divide_tool()).tool(greet_tool());
+        let server = claude_code_agent::SdkMcpServer::new("t").tool(divide_tool()).tool(greet_tool());
 
         let ok = call(&server, "divide", serde_json::json!({ "a": 9, "b": 3 })).await;
         assert_eq!(ok["content"][0]["text"], "3.0");

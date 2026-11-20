@@ -2,7 +2,7 @@
 //! Claude sees them as `mcp__inventory__<name>`; calls run in this process.
 //!
 //! Run: cargo run --example tools --features macros
-use claude_sdk::{claude_tool, Agent, AgentEvent, Initialize, SdkMcpServer, Session, SessionOptions};
+use claude_code_agent::{claude_tool, Agent, AgentEvent, Initialize, SdkMcpServer, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 /// Look up how many units of a product are in stock

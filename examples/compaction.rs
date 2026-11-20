@@ -1,8 +1,8 @@
 //! Compact the context on demand with custom instructions.
 //!
 //! Run: cargo run --example compaction
-use claude_sdk::protocol::{HookEventKind, HookOutput};
-use claude_sdk::{compaction, Agent, AgentEvent, HookRegistry, Initialize, Session, SessionOptions};
+use claude_code_agent::protocol::{HookEventKind, HookOutput};
+use claude_code_agent::{compaction, Agent, AgentEvent, HookRegistry, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 #[tokio::main]

@@ -2,7 +2,7 @@
 //! A reused session is reset with /clear, so tasks never share a conversation.
 //!
 //! Run: cargo run --example pool
-use claude_sdk::{Agent, AgentEvent, PoolConfig, SessionOptions, SessionPool};
+use claude_code_agent::{Agent, AgentEvent, PoolConfig, SessionOptions, SessionPool};
 use tokio_stream::StreamExt;
 
 async fn run(pool: &SessionPool, prompt: &str) -> anyhow::Result<String> {

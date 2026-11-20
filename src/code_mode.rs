@@ -152,7 +152,7 @@ fn read_u64(data: &[u8], at: usize) -> Result<u64, CodeModeError> {
 static BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Path of a patched copy of `binary` (resolved through `PATH`), built on
-/// first use and cached under `<cache>/claude-sdk/code-mode/`. The cache key
+/// first use and cached under `<cache>/claude-code-agent/code-mode/`. The cache key
 /// is the installed binary's name, size and mtime plus this SDK's version,
 /// so a CLI update or a new patch builds a new copy.
 pub async fn patched_binary(binary: &Path) -> Result<PathBuf, CodeModeError> {
@@ -264,7 +264,7 @@ fn cache_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    base.join("claude-sdk").join("code-mode")
+    base.join("claude-code-agent").join("code-mode")
 }
 
 /// macOS kills a modified binary unless it is re-signed; the stock

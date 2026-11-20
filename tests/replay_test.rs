@@ -1,6 +1,6 @@
 //! Replay tests — no CLI process, no API cost.
-use claude_sdk::replay::{replay, Recording};
-use claude_sdk::{Agent, AgentEvent, SessionOptions, TurnResult};
+use claude_code_agent::replay::{replay, Recording};
+use claude_code_agent::{Agent, AgentEvent, SessionOptions, TurnResult};
 use tokio_stream::StreamExt;
 
 /// Turn 1 is prompted; the CLI then starts a turn by itself (`origin` set, as
@@ -44,7 +44,7 @@ fn cli_started_turn_stays_with_next_prompted_turn() {
 
 #[tokio::test]
 async fn prompt_stream_holds_only_its_own_turn() {
-    let path = std::env::temp_dir().join(format!("claude-sdk-replay-{}.jsonl", std::process::id()));
+    let path = std::env::temp_dir().join(format!("claude-code-agent-replay-{}.jsonl", std::process::id()));
     std::fs::write(&path, RECORDING).expect("write recording");
 
     let session = replay(&path, SessionOptions::default()).await.expect("replay");

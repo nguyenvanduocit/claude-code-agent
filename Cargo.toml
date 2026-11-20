@@ -1,6 +1,6 @@
 [package]
-name = "claude-sdk"
-version = "0.5.0"
+name = "claude-code-agent"
+version = "0.6.0"
 rust-version = "1.88"
 edition = "2024"
 description = "Rust SDK for Claude Code — persistent subprocess, hook callbacks, in-process tools, record/replay"
@@ -9,13 +9,14 @@ repository = "https://github.com/nguyenvanduocit/claude-sdk-rs"
 readme = "README.md"
 keywords = ["claude", "claude-code", "anthropic", "agent", "sdk"]
 categories = ["api-bindings", "asynchronous"]
+include = ["src/**", "examples/**", "tests/**", "README.md", "LICENSE"]
 
 [workspace]
-members = ["claude-sdk-macros"]
+members = ["claude-code-agent-macros"]
 
 [features]
 default = []
-macros  = ["dep:claude-sdk-macros"]
+macros  = ["dep:claude-code-agent-macros"]
 
 [dependencies]
 tokio        = { version = "1", features = ["rt", "process", "io-util", "sync", "time", "fs", "macros"] }
@@ -25,7 +26,7 @@ thiserror    = "2"
 tracing      = "0.1"
 dashmap      = "6"
 
-claude-sdk-macros      = { version = "0.5.0", path = "claude-sdk-macros", optional = true }
+claude-code-agent-macros      = { version = "0.6.0", path = "claude-code-agent-macros", optional = true }
 
 tokio-stream = "0.1.19"
 async-stream = "0.3.6"
@@ -40,7 +41,7 @@ tokio             = { version = "1", features = ["full"] }
 tokio-stream      = "0.1.19"
 anyhow            = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-claude-sdk-macros = { version = "0.5.0", path = "claude-sdk-macros" }
+claude-code-agent-macros = { version = "0.6.0", path = "claude-code-agent-macros" }
 
 [[example]]
 name = "tools"

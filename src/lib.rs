@@ -1,4 +1,4 @@
-//! **claude-sdk** — Rust SDK for Claude Code.
+//! **claude-code-agent** — Rust SDK for Claude Code.
 //!
 //! Drives the `claude` CLI (verified against 2.1.328) over its stream-json
 //! control protocol: one persistent process per session, Rust closures as
@@ -8,7 +8,7 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use claude_sdk::{Session, SessionOptions, Initialize, Agent, AgentEvent};
+//! use claude_code_agent::{Session, SessionOptions, Initialize, Agent, AgentEvent};
 //! use tokio_stream::StreamExt;
 //!
 //! #[tokio::main]
@@ -39,8 +39,8 @@
 //! # With hooks
 //!
 //! ```rust,no_run
-//! use claude_sdk::{Agent, AgentEvent, CanUseTool, HookRegistry, Initialize, Session, SessionOptions};
-//! use claude_sdk::protocol::{HookOutput, ToolDecision};
+//! use claude_code_agent::{Agent, AgentEvent, CanUseTool, HookRegistry, Initialize, Session, SessionOptions};
+//! use claude_code_agent::protocol::{HookOutput, ToolDecision};
 //! use tokio_stream::StreamExt;
 //!
 //! #[tokio::main]
@@ -78,7 +78,7 @@
 //! # With session pool (high throughput)
 //!
 //! ```rust,no_run
-//! use claude_sdk::{SessionPool, PoolConfig, Agent, AgentEvent};
+//! use claude_code_agent::{SessionPool, PoolConfig, Agent, AgentEvent};
 //! use tokio_stream::StreamExt;
 //!
 //! #[tokio::main]
@@ -130,7 +130,7 @@ pub use hooks::HookRegistry;
 pub use mcp::{SdkMcpServer, SdkTool, ToolContent, ToolContext, ToolResult};
 /// `#[claude_tool]` — enable with the `macros` feature.
 #[cfg(feature = "macros")]
-pub use claude_sdk_macros::claude_tool;
+pub use claude_code_agent_macros::claude_tool;
 pub use pool::{Checkout, PoolConfig, PooledSession, SessionPool};
 pub use protocol::{
     // Core messages

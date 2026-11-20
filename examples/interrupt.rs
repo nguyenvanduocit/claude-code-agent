@@ -1,7 +1,7 @@
 //! Interrupt a running turn from another task.
 //!
 //! Run: cargo run --example interrupt
-use claude_sdk::{Agent, AgentEvent, Initialize, Session, SessionOptions};
+use claude_code_agent::{Agent, AgentEvent, Initialize, Session, SessionOptions};
 use tokio_stream::StreamExt;
 
 #[tokio::main]

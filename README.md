@@ -1,4 +1,4 @@
-# claude-sdk
+# claude-code-agent
 
 Rust SDK for [Claude Code](https://claude.ai/claude-code). It drives the `claude` CLI over its stream-json control protocol. Verified against 2.1.329; `Session::spawn` refuses an older CLI (`MIN_CLI_VERSION`).
 
@@ -14,16 +14,14 @@ Rust SDK for [Claude Code](https://claude.ai/claude-code). It drives the `claude
 
 ## Install
 
-Pin the git dependency to a commit or tag:
-
 ```toml
-claude-sdk = { git = "https://github.com/nguyenvanduocit/claude-sdk-rs", tag = "v0.5.0", features = ["macros"] }
+claude-code-agent = { version = "0.6", features = ["macros"] }
 ```
 
 ## Quick start
 
 ```rust
-use claude_sdk::{Session, SessionOptions, Initialize, Agent, AgentEvent};
+use claude_code_agent::{Session, SessionOptions, Initialize, Agent, AgentEvent};
 use tokio_stream::StreamExt;
 
 #[tokio::main]
@@ -52,8 +50,8 @@ async fn main() -> anyhow::Result<()> {
 Hooks are declared before spawn — the CLI learns them from the `initialize` request.
 
 ```rust
-use claude_sdk::{CanUseTool, HookRegistry, Initialize, Session, SessionOptions};
-use claude_sdk::protocol::{HookEventKind, HookOutput, ToolDecision};
+use claude_code_agent::{CanUseTool, HookRegistry, Initialize, Session, SessionOptions};
+use claude_code_agent::protocol::{HookEventKind, HookOutput, ToolDecision};
 
 let mut hooks = HookRegistry::new();
 
@@ -81,7 +79,7 @@ let session = Session::spawn(opts, Initialize::default()).await?;
 ## Session pool — high throughput
 
 ```rust
-use claude_sdk::{SessionPool, PoolConfig, Agent, AgentEvent};
+use claude_code_agent::{SessionPool, PoolConfig, Agent, AgentEvent};
 
 let pool = SessionPool::new(PoolConfig { max_sessions: 4, ..Default::default() });
 pool.warm(2).await; // pre-warm 2 idle processes
@@ -96,7 +94,7 @@ Every pooled session uses `PoolConfig::options` (hooks, MCP servers, model). `po
 ## Rust functions as tools — `#[claude_tool]` + SDK MCP server
 
 ```rust
-use claude_sdk::{claude_tool, SdkMcpServer, Session, SessionOptions, Initialize};
+use claude_code_agent::{claude_tool, SdkMcpServer, Session, SessionOptions, Initialize};
 
 /// Search files matching a glob pattern
 #[claude_tool]
@@ -115,7 +113,7 @@ let session = Session::spawn(opts, Initialize::default()).await?;
 
 The macro generates `search_files_tool_def() -> ToolDef` and `search_files_tool() -> SdkTool`.
 Arguments are decoded with serde; `Result<T, E>` maps to a result or an error result.
-SDK tools are added to `--allowedTools` automatically. Enable with `claude-sdk = { features = ["macros"] }`.
+SDK tools are added to `--allowedTools` automatically. Enable with `claude-code-agent = { features = ["macros"] }`.
 
 ## Events and results
 
@@ -153,13 +151,13 @@ When the CLI withdraws a request it asked the host (e.g. `can_use_tool` during a
 ```rust
 let opts = SessionOptions { record: Some("hi.jsonl".into()), ..Default::default() };
 // … run a live session once …
-let session = claude_sdk::replay::replay("hi.jsonl", SessionOptions::default()).await?;
+let session = claude_code_agent::replay::replay("hi.jsonl", SessionOptions::default()).await?;
 ```
 
 ## Compaction
 
 ```rust
-let mut stream = claude_sdk::compaction::compact(&agent, Some("keep file paths and errors")).await?;
+let mut stream = claude_code_agent::compaction::compact(&agent, Some("keep file paths and errors")).await?;
 // yields AgentEvent::Compacted { trigger: "manual", pre_tokens, post_tokens }, then Done
 ```
 
@@ -173,7 +171,7 @@ let mut stream = claude_sdk::compaction::compact(&agent, Some("keep file paths a
 let opts = SessionOptions { code_mode: true, ..Default::default() };
 ```
 
-Experimental and unsupported by Anthropic: Code Mode is gated server-side, and this option forces it on. Claude gets the `REPL` tool and works by writing JavaScript that calls its tools. The stock CLI refuses Code Mode for every non-interactive session, so the SDK runs a patched copy. It is built on first use (about 6 s), cached under `~/.cache/claude-sdk/code-mode/`, and re-signed on macOS. The installed `claude` is not modified. The patch changes only the Code Mode opt-in module: the eligibility check passes, the caveats count as accepted, and the server gate counts as open. See DESIGN.md.
+Experimental and unsupported by Anthropic: Code Mode is gated server-side, and this option forces it on. Claude gets the `REPL` tool and works by writing JavaScript that calls its tools. The stock CLI refuses Code Mode for every non-interactive session, so the SDK runs a patched copy. It is built on first use (about 6 s), cached under `~/.cache/claude-code-agent/code-mode/`, and re-signed on macOS. The installed `claude` is not modified. The patch changes only the Code Mode opt-in module: the eligibility check passes, the caveats count as accepted, and the server gate counts as open. See DESIGN.md.
 
 ## Session options worth knowing
 
