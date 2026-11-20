@@ -8,6 +8,7 @@ license = "MIT"
 [features]
 default = []
 otel    = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry"]
+macros  = ["dep:claude-sdk-macros"]
 
 [dependencies]
 tokio        = { version = "1", features = ["full"] }
