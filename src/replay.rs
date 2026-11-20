@@ -1,30 +1,131 @@
-/// Deterministic record/replay for testing.
+/// Deterministic record/replay — run the SDK without a CLI process or API cost.
 ///
-/// Record: capture all InboundMessages to a JSONL file.
-/// Replay: feed them back without spawning a real subprocess.
+/// Record: `SessionOptions::record = Some(path)` writes every stdout line of a
+/// live session to a JSONL file.
+/// Replay: `replay::replay(path, opts)` returns a `Session` backed by an
+/// in-memory fake CLI that answers `initialize` with the recorded response and
+/// plays back one recorded turn per user message.
 ///
-/// Source: Fork B design (record/replay via event stream)
+/// Control requests the CLI made during recording (hooks, can_use_tool,
+/// mcp_message) are not replayed: their answers came from host code, which a
+/// replay does not re-run.
 use std::path::Path;
 
-/// A recorded session — JSONL file of InboundMessages.
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+use crate::protocol::Initialize;
+use crate::session::{ExitInfo, Result, Session, SessionError, SessionOptions, Transport};
+
+/// A recording split into the initialize response and per-turn frames.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Recording {
-    pub path: std::path::PathBuf,
+    /// Payload of the CLI's answer to `initialize`.
+    pub initialize_response: Value,
+    /// Frames of each prompted turn, ending with its `result` line. Turns the
+    /// CLI started itself are kept in front of the following prompted turn.
+    pub turns: Vec<Vec<String>>,
 }
 
 impl Recording {
-    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
-        Self { path: path.into() }
+    /// Parse a JSONL recording.
+    pub fn parse(jsonl: &str) -> Result<Self> {
+        let mut initialize_response = None;
+        let mut turns = vec![];
+        let mut current = vec![];
+        for line in jsonl.lines().filter(|l| !l.trim().is_empty()) {
+            let frame: Value = serde_json::from_str(line)?;
+            match frame.get("type").and_then(Value::as_str) {
+                Some("control_response") => {
+                    if initialize_response.is_none() {
+                        initialize_response =
+                            Some(frame["response"].get("response").cloned().unwrap_or(Value::Null));
+                    }
+                }
+                Some("control_request") => {}
+                // A result with `origin` ends a turn the CLI started itself;
+                // it is replayed in front of the next prompted turn.
+                Some("result") if frame.get("origin").is_none() => {
+                    current.push(line.to_string());
+                    turns.push(std::mem::take(&mut current));
+                }
+                _ => current.push(line.to_string()),
+            }
+        }
+        let initialize_response = initialize_response.ok_or_else(|| {
+            SessionError::Io(std::io::Error::other("recording has no initialize response"))
+        })?;
+        Ok(Self { initialize_response, turns })
+    }
+
+    pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::parse(&tokio::fs::read_to_string(path).await?)
     }
 }
 
-/// A replay session that reads from a Recording instead of a live subprocess.
-/// Implement by wrapping Session with a fake Child that reads from a file.
-pub struct ReplaySession {
-    pub recording: Recording,
+/// A Session that replays `path` instead of running the CLI.
+/// Use the same `include_partial` as the recording.
+pub async fn replay(path: impl AsRef<Path>, opts: SessionOptions) -> Result<Session> {
+    let recording = Recording::load(path).await?;
+    let (host, cli) = tokio::io::duplex(1 << 16);
+    let (host_out, host_in) = tokio::io::split(host);
+    let fake = tokio::spawn(fake_cli(cli, recording));
+    let exit = Box::pin(async move {
+        let code = fake.await.ok().map(|_| 0);
+        ExitInfo { code, stderr: String::new() }
+    });
+    let transport = Transport { stdin: Box::new(host_in), stdout: Box::new(host_out), exit };
+    Session::connect(transport, opts, Initialize::default()).await
 }
 
-impl ReplaySession {
-    pub fn new(recording: Recording) -> Self {
-        Self { recording }
+async fn fake_cli(io: tokio::io::DuplexStream, recording: Recording) {
+    let (read, mut write) = tokio::io::split(io);
+    let mut lines = BufReader::new(read).lines();
+    let mut turns = recording.turns.into_iter();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        let out: Vec<String> = match msg.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                let is_init = msg["request"]["subtype"] == "initialize";
+                let payload = if is_init { recording.initialize_response.clone() } else { json!({}) };
+                vec![json!({
+                    "type": "control_response",
+                    "response": { "subtype": "success", "request_id": msg["request_id"], "response": payload },
+                })
+                .to_string()]
+            }
+            Some("user") => turns.next().map(|frames| with_echo_uuid(frames, &msg["uuid"])).unwrap_or_else(|| {
+                vec![
+                    json!({ "type": "user", "isReplay": true, "uuid": msg["uuid"], "message": msg["message"] })
+                        .to_string(),
+                    json!({
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "error": "replay exhausted: no recorded turn left",
+                    })
+                    .to_string(),
+                ]
+            }),
+            _ => vec![],
+        };
+        for frame in out {
+            if write.write_all(frame.as_bytes()).await.is_err() || write.write_all(b"\n").await.is_err() {
+                return;
+            }
+        }
     }
+}
+
+/// Point the recorded prompt echo at the uuid of the prompt being replayed.
+fn with_echo_uuid(frames: Vec<String>, uuid: &Value) -> Vec<String> {
+    frames
+        .into_iter()
+        .map(|line| match serde_json::from_str::<Value>(&line) {
+            Ok(mut f) if f["type"] == "user" && f["isReplay"] == true => {
+                f["uuid"] = uuid.clone();
+                f.to_string()
+            }
+            _ => line,
+        })
+        .collect()
 }

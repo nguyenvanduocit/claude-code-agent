@@ -1,11 +1,11 @@
 /// Compile-checks that #[claude_tool] output integrates with claude_sdk::protocol::ToolDef.
 ///
 /// This is an integration test run with: cargo test --features macros
-/// It confirms the generated <name>_tool_def() -> ToolDef can be passed
-/// directly into Initialize::tools without any type conversion.
+/// It confirms the generated <name>_tool_def() returns claude_sdk::protocol::ToolDef.
 #[cfg(feature = "macros")]
 mod macro_integration {
-    use claude_sdk::protocol::{Initialize, ToolDef};
+    #![allow(unused_variables, dead_code)]
+    use claude_sdk::protocol::ToolDef;
     use claude_sdk_macros::claude_tool;
 
     /// List files in a directory
@@ -50,17 +50,42 @@ mod macro_integration {
         assert_eq!(schema["properties"]["to_unit"]["type"], "string");
     }
 
-    #[test]
-    fn tool_def_can_go_into_initialize_tools() {
-        // The key integration check: ToolDef from macro slots into Initialize::tools.
-        let init = Initialize {
-            kind: "initialize".into(),
-            cwd: "/tmp".into(),
-            tools: vec![list_files_tool_def(), convert_temp_tool_def()],
-            ..Default::default()
-        };
-        assert_eq!(init.tools.len(), 2);
-        assert_eq!(init.tools[0].name, "list_files");
-        assert_eq!(init.tools[1].name, "convert_temp");
+    /// Divide two numbers
+    #[claude_tool]
+    fn divide(a: f64, b: f64) -> Result<f64, String> {
+        if b == 0.0 { Err("division by zero".into()) } else { Ok(a / b) }
+    }
+
+    /// Greet someone
+    #[claude_tool]
+    async fn greet(name: &str) -> String {
+        format!("hello {name}")
+    }
+
+    async fn call(server: &claude_sdk::SdkMcpServer, tool: &str, args: serde_json::Value) -> serde_json::Value {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": { "name": tool, "arguments": args },
+        });
+        server.handle(&msg).await["result"].clone()
+    }
+
+    #[tokio::test]
+    async fn generated_handler_decodes_args_and_maps_results() {
+        let server = claude_sdk::SdkMcpServer::new("t").tool(divide_tool()).tool(greet_tool());
+
+        let ok = call(&server, "divide", serde_json::json!({ "a": 9, "b": 3 })).await;
+        assert_eq!(ok["content"][0]["text"], "3.0");
+        assert!(ok.get("isError").is_none());
+
+        let err = call(&server, "divide", serde_json::json!({ "a": 1, "b": 0 })).await;
+        assert_eq!(err["content"][0]["text"], "division by zero");
+        assert_eq!(err["isError"], true);
+
+        let bad = call(&server, "divide", serde_json::json!({ "a": "x" })).await;
+        assert_eq!(bad["isError"], true);
+
+        let hi = call(&server, "greet", serde_json::json!({ "name": "rust" })).await;
+        assert_eq!(hi["content"][0]["text"], "hello rust");
     }
 }

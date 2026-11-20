@@ -5,76 +5,68 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ─── Outbound: host → CLI ────────────────────────────────────────────────────
+//
+// Wire format verified against the official Python SDK
+// (claude_agent_sdk 0.1.48, _internal/query.py:150–160, :238–375) and the
+// zod schemas inside the Claude Code 2.1.328 binary.
 
-/// Session init. Sent once after `--await-initialize` prompt.
-/// Source: chunk-20bv8pca.js:17716–17891 (qfo schema)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Initialize {
+/// Envelope for every host → CLI control request:
+/// `{"type":"control_request","request_id":"…","request":{"subtype":"…",…}}`.
+/// Source: query.py:368–372
+#[derive(Debug, Clone, Serialize)]
+pub struct OutboundControlRequest<'a, B: Serialize> {
     #[serde(rename = "type")]
-    pub kind: String, // always "initialize"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key_source: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub betas: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
-    pub cwd: String,
-    /// SDK-side function hooks — CLI calls back via hook_callback IPC.
-    /// Source: chunk-f89nsf5q.query.js:1953–1963 (hookCallbackIds)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hook_callback_ids: Vec<HookCallbackId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission_mode: Option<String>,
-    /// Interrupt spares background agents instead of killing them all.
-    /// Source: chunk-20bv8pca.js (perTaskStopAffordance)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub per_task_stop_affordance: Option<bool>,
-    /// Observe the full nested agent tree via SubagentStart/Stop hooks.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub forward_nested_subagent_tool_calls: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<ToolDef>,
-    /// Pre-loaded MCP manifests — skips N×2 round-trips at spawn time.
-    /// Source: chunk-20bv8pca.js:17732–17752
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sdk_mcp_server_manifests: Vec<McpManifest>,
+    pub kind: &'static str, // "control_request"
+    pub request_id: &'a str,
+    pub request: &'a B,
 }
 
-impl Initialize {
-    pub fn new(cwd: impl Into<String>) -> Self {
-        Self {
-            kind: "initialize".into(),
-            cwd: cwd.into(),
-            ..Default::default()
-        }
-    }
+/// Body of the `initialize` control request — the first stdin line.
+///
+/// Process-level settings (cwd, model, permission mode, session id) are CLI
+/// flags, not initialize fields; they live on `SessionOptions`.
+/// `hooks` is filled in by `Session::spawn` from `SessionOptions::hooks`.
+/// Source: binary initialize schema (subtype "initialize", hooks, agents,
+/// systemPrompt, appendSystemPrompt, jsonSchema, …); query.py:150–155
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Initialize {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HashMap<HookEventKind, Vec<HookMatcherConfig>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub append_system_prompt: Option<String>,
+    /// Subagent definitions, keyed by agent name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents: Option<serde_json::Value>,
+    /// JSON schema for structured output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<serde_json::Value>,
 }
 
-/// A registered SDK-side hook callback.
-/// Source: chunk-20bv8pca.js:19959–19979; chunk-mpj2xm2s.js:6
-/// ID format: `<instanceId>/<event>/<index>`, regex ^([A-Za-z0-9][A-Za-z0-9._-]{0,63})\/([A-Za-z]{1,64})\/\d{1,4}$
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HookCallbackId {
-    pub id: String,
-    pub event: HookEventKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
+/// One hook matcher in the initialize request.
+/// Source: query.py:142–147 (`matcher`, `hookCallbackIds`, `timeout`)
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookMatcherConfig {
     pub matcher: Option<String>,
+    pub hook_callback_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_s: Option<u32>,
+    pub timeout: Option<u32>,
 }
 
 /// A user turn.
+/// Source: _internal/client.py:126–131
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
     #[serde(rename = "type")]
     pub kind: String, // "user"
     pub message: UserMessageBody,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uuid: Option<String>,
+    pub parent_tool_use_id: Option<String>,
+    /// Echoed back (`isReplay: true`) when the CLI starts this message's turn,
+    /// because the session runs with `--replay-user-messages`.
+    pub uuid: String,
 }
 
 impl UserMessage {
@@ -85,7 +77,8 @@ impl UserMessage {
                 role: "user".into(),
                 content: vec![ContentBlock::Text { text: content.into() }],
             },
-            uuid: None,
+            parent_tool_use_id: None,
+            uuid: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -108,92 +101,136 @@ pub enum ContentBlock {
     },
 }
 
-/// Control message: host → CLI.
-/// Source: chunk-20bv8pca.js:12030–12046 (can_use_tool response)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Envelope for every host → CLI answer to a CLI-initiated control request.
+/// Source: query.py:325–345
+#[derive(Debug, Clone, Serialize)]
 pub struct ControlResponse {
     #[serde(rename = "type")]
-    pub kind: String, // "control_response"
-    pub request_id: String,
-    pub subtype: String,
-    #[serde(flatten)]
-    pub payload: ControlResponsePayload,
+    pub kind: &'static str, // "control_response"
+    pub response: ControlResponseBody,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ControlResponsePayload {
-    CanUseTool(ToolDecision),
-    HookCallback(HookCallbackReply),
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "subtype", rename_all = "lowercase")]
+pub enum ControlResponseBody {
+    Success { request_id: String, response: serde_json::Value },
+    Error { request_id: String, error: String },
 }
 
-/// Allow or deny a tool call.
-/// Source: chunk-20bv8pca.js:12030–12046
+impl ControlResponse {
+    pub fn success(request_id: impl Into<String>, response: serde_json::Value) -> Self {
+        Self {
+            kind: "control_response",
+            response: ControlResponseBody::Success { request_id: request_id.into(), response },
+        }
+    }
+    pub fn error(request_id: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            kind: "control_response",
+            response: ControlResponseBody::Error { request_id: request_id.into(), error: error.into() },
+        }
+    }
+}
+
+/// Answer to a `can_use_tool` request.
+/// Source: query.py:265–281 (`behavior`, `updatedInput`, `message`, `interrupt`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "behavior")]
+#[serde(tag = "behavior", rename_all = "camelCase")]
 pub enum ToolDecision {
+    /// `updated_input: None` → the original input is sent back unchanged.
     #[serde(rename = "allow")]
     Allow {
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
         updated_input: Option<serde_json::Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tool_use_id: Option<String>,
     },
     #[serde(rename = "deny")]
     Deny {
         message: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         interrupt: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tool_use_id: Option<String>,
     },
 }
 
-/// Reply to a hook_callback IPC call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HookCallbackReply {
-    pub callback_id: String,
-    pub output: HookOutput,
+impl ToolDecision {
+    pub fn allow() -> Self { Self::Allow { updated_input: None } }
+    pub fn deny(message: impl Into<String>) -> Self {
+        Self::Deny { message: message.into(), interrupt: None }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Hook result — the same JSON a shell hook prints on stdout.
+/// Source: binary hook-output schema (continue, suppressOutput, stopReason,
+/// decision, systemMessage, reason, hookSpecificOutput).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct HookOutput {
-    /// exit-code-2 equivalent: stderr injected to model, loop continues.
+    /// `false` stops the whole agent loop.
+    #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
+    pub continue_: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_message: Option<String>,
-    /// Additional context injected as a system message.
+    pub suppress_output: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub additional_context: Option<String>,
-    /// watchPaths for FileChanged/CwdChanged.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub watch_paths: Vec<String>,
-    /// For PreCompact: custom summarization instructions.
+    pub stop_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub compact_instructions: Option<String>,
+    pub decision: Option<HookDecision>,
+    /// Warning shown to the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<String>,
+    /// Reason fed back to the model when `decision` is `block`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Event-specific output; must carry `hookEventName`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hook_specific_output: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookDecision {
+    Approve,
+    Block,
 }
 
 impl HookOutput {
-    pub fn allow() -> Self {
-        Self { block_message: None, additional_context: None, watch_paths: vec![], compact_instructions: None }
+    /// No opinion — the CLI proceeds as if the hook printed nothing.
+    pub fn allow() -> Self { Self::default() }
+
+    /// Block the action; `reason` is shown to the model.
+    pub fn block(reason: impl Into<String>) -> Self {
+        Self { decision: Some(HookDecision::Block), reason: Some(reason.into()), ..Self::default() }
     }
-    pub fn block(msg: impl Into<String>) -> Self {
-        Self { block_message: Some(msg.into()), ..Self::allow() }
+
+    /// Inject `additionalContext` for the given event.
+    pub fn with_context(event: HookEventKind, context: impl Into<String>) -> Self {
+        Self {
+            hook_specific_output: Some(serde_json::json!({
+                "hookEventName": event,
+                "additionalContext": context.into(),
+            })),
+            ..Self::default()
+        }
     }
-    pub fn with_context(ctx: impl Into<String>) -> Self {
-        Self { additional_context: Some(ctx.into()), ..Self::allow() }
+
+    /// Register `watchPaths` for FileChanged hooks (valid for CwdChanged / FileChanged).
+    pub fn watch_paths(event: HookEventKind, paths: Vec<String>) -> Self {
+        Self {
+            hook_specific_output: Some(serde_json::json!({
+                "hookEventName": event,
+                "watchPaths": paths,
+            })),
+            ..Self::default()
+        }
     }
-    pub fn compact_instructions(instr: impl Into<String>) -> Self {
-        Self { compact_instructions: Some(instr.into()), ..Self::allow() }
-    }
+
+    pub fn is_block(&self) -> bool { self.decision == Some(HookDecision::Block) }
 }
 
-/// Background a specific task (Ctrl+B equivalent).
+/// Body of a `background_tasks` control request (Ctrl+B equivalent).
+/// Send with `Session::control(&body)`.
 /// Source: chunk-20bv8pca.js:20970–20978
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BackgroundTasksRequest {
-    #[serde(rename = "type")]
-    pub kind: String, // "control_request"
-    pub subtype: String, // "background_tasks"
+    pub subtype: &'static str, // "background_tasks"
     /// None = background all foreground tasks; Some = background specific tool_use_id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
@@ -201,24 +238,11 @@ pub struct BackgroundTasksRequest {
 
 impl BackgroundTasksRequest {
     pub fn all() -> Self {
-        Self { kind: "control_request".into(), subtype: "background_tasks".into(), tool_use_id: None }
+        Self { subtype: "background_tasks", tool_use_id: None }
     }
     pub fn one(tool_use_id: impl Into<String>) -> Self {
-        Self { kind: "control_request".into(), subtype: "background_tasks".into(), tool_use_id: Some(tool_use_id.into()) }
+        Self { subtype: "background_tasks", tool_use_id: Some(tool_use_id.into()) }
     }
-}
-
-/// Interrupt a running turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InterruptRequest {
-    #[serde(rename = "type")]
-    pub kind: String,  // "control_request"
-    pub subtype: String, // "interrupt"
-    pub request_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cancel_queued: Option<bool>,
 }
 
 // ─── Inbound: CLI → host ─────────────────────────────────────────────────────
@@ -231,6 +255,9 @@ pub enum InboundMessage {
     /// Per-turn metadata. First frame before each turn.
     #[serde(rename = "system")]
     System(SystemMessage),
+    /// A user message: the echo of a host prompt (`is_replay`) or a tool result.
+    #[serde(rename = "user")]
+    User(InboundUserMessage),
     /// Complete assistant message block.
     #[serde(rename = "assistant")]
     Assistant(AssistantMessage),
@@ -244,43 +271,36 @@ pub enum InboundMessage {
     /// Source: chunk-20bv8pca.js:18214
     #[serde(rename = "control_request")]
     ControlRequest(ControlRequest),
-    /// Context compaction checkpoint.
-    #[serde(rename = "compact_boundary")]
-    CompactBoundary(CompactBoundaryMessage),
-    /// Extended thinking partial (needs thinking betas).
-    #[serde(rename = "thinking_tokens")]
-    ThinkingTokens { content: String },
-    /// Background task tree update (level signal — replace semantics).
-    /// Source: chunk-20bv8pca.js:16351–16369
-    #[serde(rename = "background_tasks_changed")]
-    BackgroundTasksChanged(BackgroundTasksChangedMessage),
-    /// Model was switched during the turn.
-    #[serde(rename = "model_fallback")]
-    ModelFallback { from_model: Option<String>, to_model: String },
-    /// Model refused with no fallback.
-    #[serde(rename = "model_refusal_no_fallback")]
-    ModelRefusalNoFallback { reason: Option<String> },
+    /// CLI answering a host-initiated control request (initialize, interrupt, …).
+    /// Source: query.py:180–192
+    #[serde(rename = "control_response")]
+    ControlResponse(InboundControlResponse),
     /// Process keepalive with startup marker.
     /// Source: chunk-f89nsf5q.query.js:1403–1410
     #[serde(rename = "keep_alive")]
     KeepAlive(KeepAliveMessage),
-    /// Multi-session coordination primitive.
-    /// Source: chunk-20bv8pca.js:15972
-    #[serde(rename = "peer_message_hold")]
-    PeerMessageHold(serde_json::Value),
     #[serde(other)]
     Unknown,
 }
 
-/// Per-turn metadata frame.
+/// Every `type:"system"` frame: `init` (first frame of each turn) plus
+/// `hook_started`, `hook_response`, `compact_boundary`, `model_fallback`,
+/// `background_tasks_changed`, `task_started`, `task_updated`, `task_notification`,
+/// `thinking_tokens`, `model_refusal_no_fallback`, `peer_message_hold`, … —
+/// only `subtype` and `session_id` are common to all; subtype-specific fields
+/// are in `extra`. Source: binary system-message schemas
 /// Source: chunk-hp1k7mph.js:194 (WGt function), chunk-20bv8pca.js:15125
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemMessage {
-    pub subtype: String, // "init"
-    pub cwd: String,
+    pub subtype: String, // "init" | "hook_started" | "hook_response" | …
     pub session_id: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub claude_code_version: String,
+    #[serde(default)]
     pub permission_mode: String,
     #[serde(default)]
     pub tools: Vec<String>,
@@ -297,8 +317,8 @@ pub struct SystemMessage {
 }
 
 impl SystemMessage {
-    /// MEDIUM confidence: REPL/Eval in tools[] = Code Mode active.
-    /// HIGH confidence: check env var CLAUDE_CODE_EXPERIMENTAL_CODE_MODE.
+    /// REPL/Eval in `tools[]` = Code Mode active. LOW confidence: not yet
+    /// observed live — stock 2.1.328 keeps Code Mode off (see SessionOptions::code_mode).
     pub fn code_mode_active(&self) -> bool {
         self.tools.iter().any(|t| t == "REPL" || t == "Eval")
     }
@@ -338,6 +358,16 @@ pub enum AssistantBlock {
     Unknown,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct InboundUserMessage {
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default, rename = "isReplay")]
+    pub is_replay: Option<bool>,
+    #[serde(default)]
+    pub parent_tool_use_id: Option<String>,
+}
+
 /// Partial streaming chunk.
 /// Source: chunk-20bv8pca.js:15343–15401
 #[derive(Debug, Clone, Deserialize)]
@@ -370,6 +400,10 @@ pub struct ResultMessage {
     pub stop_reason: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Set when the CLI started the turn itself (e.g. `{"kind":"task-notification"}`
+    /// after a background task finished); absent for turns the host prompted.
+    #[serde(default)]
+    pub origin: Option<serde_json::Value>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -392,40 +426,77 @@ pub struct UsageSummary {
     pub cache_creation: Option<serde_json::Value>,
 }
 
-/// CLI→host control request (tool permission or hook callback).
-/// Source: chunk-20bv8pca.js:18214 (can_use_tool), :19959–19979 (hook_callback)
+/// CLI → host control request envelope:
+/// `{"type":"control_request","request_id":"…","request":{"subtype":"…",…}}`.
+/// Source: query.py:236–240
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlRequest {
-    pub subtype: String,       // "can_use_tool" | "hook_callback"
     pub request_id: String,
-    #[serde(flatten)]
-    pub payload: ControlRequestPayload,
+    pub request: ControlRequestBody,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum ControlRequestPayload {
+#[serde(tag = "subtype")]
+pub enum ControlRequestBody {
+    /// Only sent when the CLI runs with `--permission-prompt-tool stdio`.
+    #[serde(rename = "can_use_tool")]
     CanUseTool(CanUseToolRequest),
+    #[serde(rename = "hook_callback")]
     HookCallback(HookCallbackRequest),
-    Other(serde_json::Value),
+    /// JSON-RPC message for an SDK MCP server. Source: query.py:305–320
+    #[serde(rename = "mcp_message")]
+    McpMessage(McpMessageRequest),
+    /// Future subtypes — answered with an error response.
+    #[serde(other)]
+    Unsupported,
 }
 
+/// Source: binary can_use_tool schema; query.py:244–262
 #[derive(Debug, Clone, Deserialize)]
 pub struct CanUseToolRequest {
     pub tool_name: String,
-    pub tool_input: serde_json::Value,
+    pub input: serde_json::Value,
     #[serde(default)]
     pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub permission_suggestions: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub decision_reason: Option<String>,
 }
 
-/// Hook callback IPC from CLI.
-/// Source: chunk-20bv8pca.js:19959–19979
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpMessageRequest {
+    pub server_name: String,
+    pub message: serde_json::Value,
+}
+
+/// Source: binary hook_callback schema (callback_id, input, tool_use_id, issued_at)
 #[derive(Debug, Clone, Deserialize)]
 pub struct HookCallbackRequest {
-    pub callback_id: String,          // "<instanceId>/<event>/<index>"
+    pub callback_id: String,
     pub input: HookEventPayload,
-    pub issued_at: u64,
-    pub deadline_ms: u64,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// Epoch ms on the CLI's clock when the request was issued.
+    #[serde(default)]
+    pub issued_at: Option<u64>,
+}
+
+/// CLI → host answer to a host-initiated control request.
+/// Source: query.py:180–192
+#[derive(Debug, Clone, Deserialize)]
+pub struct InboundControlResponse {
+    pub response: InboundControlResponseBody,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InboundControlResponseBody {
+    pub subtype: String, // "success" | "error"
+    pub request_id: String,
+    #[serde(default)]
+    pub response: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Input to a hook handler. Contains all event-specific fields.
@@ -455,34 +526,28 @@ pub struct HookEventPayload {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// Context-compaction checkpoint.
-/// Source: chunk-20bv8pca.js:15408
-#[derive(Debug, Clone, Deserialize)]
-pub struct CompactBoundaryMessage {
-    #[serde(default)]
-    pub session_id: Option<String>,
-}
-
-/// Background task tree snapshot (replace semantics).
-/// Source: chunk-20bv8pca.js:16307–16311, 16351–16369
-#[derive(Debug, Clone, Deserialize)]
-pub struct BackgroundTasksChangedMessage {
-    pub tasks: Vec<BackgroundTask>,
-}
-
+/// One entry of a `background_tasks_changed` snapshot.
+/// Source: binary background_tasks_changed schema
 #[derive(Debug, Clone, Deserialize)]
 pub struct BackgroundTask {
-    pub id: String,
+    pub task_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// "local_bash" | "local_agent" | "local_workflow" | …
+    #[serde(default)]
+    pub task_type: String,
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    #[serde(default)]
+    pub description: String,
     #[serde(default)]
     pub parent_task_id: Option<String>,
     #[serde(default)]
-    pub task_type: Option<String>,   // "local_workflow" | "agent" | ...
+    pub ambient: Option<bool>,
     #[serde(default)]
-    pub workflow_name: Option<String>,
+    pub awaited: Option<bool>,
     #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
+    pub off_host: Option<bool>,
 }
 
 /// Process keepalive with startup marker for readiness probing.

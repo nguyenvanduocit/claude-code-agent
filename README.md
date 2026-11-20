@@ -12,7 +12,7 @@ Community Rust SDKs spawn a new `claude` process per request and expose 4–6 me
 | Hook coverage | 4–6 types | **All 33 types** |
 | Hook implementation | Shell commands | **Async Rust closures** |
 | Streaming | None | **Real `stream_event` chunks** |
-| Tool permission | None | **`on_can_use_tool` handler** |
+| Tool permission | None | **`SessionOptions::can_use_tool` handler** |
 | Session pool | None | **N pre-warmed processes** |
 | Cost tracking | None | **`total_cost_usd`, `ttft_ms`** |
 | Code Mode | None | **`code_mode: true`** |
@@ -26,10 +26,7 @@ use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let session = Session::spawn(
-        SessionOptions::default(),
-        Initialize::new("."),
-    ).await?;
+    let session = Session::spawn(SessionOptions::default(), Initialize::default()).await?;
 
     let agent = Agent::new(session);
     let mut stream = agent.prompt("hello").await?;
@@ -50,28 +47,33 @@ async fn main() -> anyhow::Result<()> {
 
 ## Hooks — async Rust closures on any of the 33 events
 
-```rust
-use claude_sdk::protocol::{HookEventKind, HookOutput};
-use claude_sdk::hooks::HookRegistryExt;
+Hooks are declared before spawn — the CLI learns them from the `initialize` request.
 
-// Block specific tools
-session.hooks().on_pre_tool_use(|payload| async move {
-    match payload.tool_name.as_deref() {
-        Some("Bash") => HookOutput::allow(),
-        Some(name)   => HookOutput::block(format!("{name} not allowed")),
-        None         => HookOutput::allow(),
-    }
-}).await;
+```rust
+use claude_sdk::{CanUseTool, HookRegistry, Initialize, Session, SessionOptions};
+use claude_sdk::protocol::{HookEventKind, HookOutput, ToolDecision};
+
+let mut hooks = HookRegistry::new();
+
+// Block a tool (matcher = tool-name regex)
+hooks.on(HookEventKind::PreToolUse, Some("Bash"), |payload| async move {
+    HookOutput::block("Bash is disabled")
+});
 
 // Inject context into every subagent
-session.hooks().on(HookEventKind::SubagentStart, None, |payload| async move {
-    HookOutput::with_context("Budget: 5 tool calls max.")
-}).await;
+hooks.on(HookEventKind::SubagentStart, None, |payload| async move {
+    HookOutput::with_context(HookEventKind::SubagentStart, "Budget: 5 tool calls max.")
+});
 
-// Custom compact summary
-session.hooks().on(HookEventKind::PreCompact, None, |payload| async move {
-    HookOutput::compact_instructions("Preserve: current task, file paths, error messages.")
-}).await;
+let opts = SessionOptions {
+    hooks,
+    // Asked whenever the CLI's permission rules would prompt (--permission-prompt-tool stdio)
+    can_use_tool: Some(CanUseTool::new(|req| async move {
+        ToolDecision::deny(format!("{} denied", req.tool_name))
+    })),
+    ..Default::default()
+};
+let session = Session::spawn(opts, Initialize::default()).await?;
 ```
 
 ## Session pool — high throughput
@@ -89,10 +91,10 @@ let (r1, r2) = tokio::join!(
 );
 ```
 
-## `#[claude_tool]` proc macro
+## Rust functions as tools — `#[claude_tool]` + SDK MCP server
 
 ```rust
-use claude_sdk_macros::claude_tool;
+use claude_sdk::{claude_tool, SdkMcpServer, Session, SessionOptions, Initialize};
 
 /// Search files matching a glob pattern
 #[claude_tool]
@@ -100,12 +102,36 @@ async fn search_files(pattern: String, max_results: u64) -> anyhow::Result<Vec<S
     // implementation
 }
 
-// Generates: search_files_tool_def() -> ToolDef
-let mut init = Initialize::new(".");
-init.tools.push(search_files_tool_def());
+let opts = SessionOptions {
+    mcp_servers: vec![SdkMcpServer::new("files").tool(search_files_tool())],
+    ..Default::default()
+};
+let session = Session::spawn(opts, Initialize::default()).await?;
+// Claude now sees `mcp__files__search_files`; calls run in-process.
 ```
 
-Enable with `claude-sdk = { features = ["macros"] }`.
+The macro generates `search_files_tool_def() -> ToolDef` and `search_files_tool() -> SdkTool`.
+Arguments are decoded with serde; `Result<T, E>` maps to a result or an error result.
+SDK tools are added to `--allowedTools` automatically. Enable with `claude-sdk = { features = ["macros"] }`.
+
+## Record / replay — tests without a process or API cost
+
+```rust
+let opts = SessionOptions { record: Some("hi.jsonl".into()), ..Default::default() };
+// … run a live session once …
+let session = claude_sdk::replay::replay("hi.jsonl", SessionOptions::default()).await?;
+```
+
+## Compaction
+
+```rust
+let mut stream = claude_sdk::compaction::compact(&agent, Some("keep file paths and errors")).await?;
+// yields AgentEvent::Compacted { trigger: "manual", pre_tokens, post_tokens }, then Done
+```
+
+## Observability
+
+`tracing` spans `claude.turn`, `claude.hook`, `claude.tool` — export with any subscriber (e.g. `tracing-opentelemetry`).
 
 ## 33 hook types
 

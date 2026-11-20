@@ -1,29 +1,20 @@
-/// Semantic compaction via PreCompact hook.
+/// Manual context compaction with custom instructions.
 ///
-/// When context approaches the limit, the CLI fires PreCompact.
-/// This module intercepts that hook and injects a custom summary
-/// produced by a separate summarizer session.
+/// `/compact <instructions>` sent as a user turn makes the CLI summarize the
+/// conversation, steering the summary with `instructions`. The turn's stream
+/// yields `AgentEvent::Compacted` and ends with `Done`.
 ///
-/// Source: chunk-20bv8pca.js hook list; compact_boundary schema line 15408
-use crate::protocol::{HookEventKind, HookOutput};
+/// Hooks see it too: PreCompact receives `trigger: "manual"` and
+/// `custom_instructions`; PostCompact receives `compact_summary`.
+/// Source: binary PreCompact / PostCompact hook input schemas,
+///         system/compact_boundary schema
+use crate::agent::{Agent, AgentError, AgentStream};
 
-/// A compaction handler that calls a user-supplied async summarizer.
-/// Register with `session.hooks().on(HookEventKind::PreCompact, ...)`.
-pub struct SemanticCompactor;
-
-impl SemanticCompactor {
-    /// Build a PreCompact hook closure that calls `summarizer` and injects
-    /// its output as custom compact instructions.
-    ///
-    /// ```rust,no_run
-    /// use claude_sdk::compaction::SemanticCompactor;
-    /// use claude_sdk::protocol::{HookEventKind, HookOutput};
-    ///
-    /// session.hooks().on(HookEventKind::PreCompact, None, |payload| async move {
-    ///     // Call your summarizer here
-    ///     let summary = "Key context: ...".to_string();
-    ///     HookOutput::compact_instructions(summary)
-    /// }).await;
-    /// ```
-    pub fn new() -> Self { Self }
+/// Compact the session's context now.
+pub async fn compact(agent: &Agent, instructions: Option<&str>) -> Result<AgentStream, AgentError> {
+    let command = match instructions {
+        Some(i) if !i.trim().is_empty() => format!("/compact {}", i.trim()),
+        _ => "/compact".to_string(),
+    };
+    agent.prompt(command).await
 }

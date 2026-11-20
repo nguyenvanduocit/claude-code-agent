@@ -13,11 +13,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-    let init = Initialize::new(&cwd);
-
     eprintln!("Spawning session...");
-    let session = Session::spawn(opts, init).await?;
+    let session = Session::spawn(opts, Initialize::default()).await?;
     eprintln!("Session ID: {:?}", session.session_id());
 
     let agent = Agent::new(session);

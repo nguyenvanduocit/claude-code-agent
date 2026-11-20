@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::protocol::Initialize;
-use crate::session::{Session, SessionOptions};
+use crate::session::{Result, Session, SessionError, SessionOptions};
 
 pub struct PoolConfig {
     pub max_sessions: usize,
@@ -62,9 +62,8 @@ impl SessionPool {
             let pool = self.clone();
             let cwd = cwd.clone();
             tasks.push(tokio::spawn(async move {
-                let opts = pool.0.config.make_opts();
-                let init = Initialize::new(&cwd);
-                Session::spawn(opts, init).await.ok()
+                let opts = pool.0.config.make_opts(&cwd);
+                Session::spawn(opts, Initialize::default()).await.ok()
             }));
         }
         let mut warmed = 0usize;
@@ -77,10 +76,14 @@ impl SessionPool {
         warmed
     }
 
-    /// Acquire a session from the pool (blocks until one is available).
-    pub async fn acquire(&self, cwd: impl Into<String>) -> PooledSession {
+    /// Acquire a session from the pool (waits until one is available).
+    /// Spawns a new process when no idle session is alive.
+    pub async fn acquire(&self, cwd: impl Into<String>) -> Result<PooledSession> {
         let cwd = cwd.into();
-        let permit = Arc::clone(&self.0.semaphore).acquire_owned().await.expect("semaphore closed");
+        let permit = Arc::clone(&self.0.semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|_| SessionError::Closed)?;
 
         // Try to reuse an idle session.
         let session = {
@@ -92,24 +95,24 @@ impl SessionPool {
             Some(s) => s,
             None => {
                 // Spawn a new session.
-                let opts = self.0.config.make_opts();
-                let init = Initialize::new(&cwd);
-                Session::spawn(opts, init).await.expect("spawn failed")
+                let opts = self.0.config.make_opts(&cwd);
+                Session::spawn(opts, Initialize::default()).await?
             }
         };
 
-        PooledSession {
+        Ok(PooledSession {
             session,
             pool: self.clone(),
             _permit: permit,
-        }
+        })
     }
 }
 
 impl PoolConfig {
-    fn make_opts(&self) -> SessionOptions {
+    fn make_opts(&self, cwd: &str) -> SessionOptions {
         SessionOptions {
             binary: self.binary.clone().into(),
+            cwd: Some(cwd.into()),
             code_mode: self.code_mode,
             tool_search: self.tool_search,
             include_partial: self.include_partial,

@@ -1,137 +1,146 @@
 /// Hook registry — async Rust closures for all 33 hook event types.
 ///
-/// CLI calls back via hook_callback IPC with deadline_ms.
-/// Source: chunk-20bv8pca.js:19959–19979; chunk-0msz7hbn.js:7–323
+/// Build it before spawning and pass it in `SessionOptions::hooks`: the CLI
+/// learns which hooks exist only from the `initialize` request, so hooks
+/// registered after spawn would never fire.
+///
+/// Each `on()` call becomes one matcher with one callback id `hook_<n>`; when
+/// the hook fires the CLI sends `hook_callback { callback_id: "hook_<n>" }`.
+/// Source: claude_agent_sdk 0.1.48 _internal/query.py:128–147, :285–300
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use crate::protocol::{HookEventKind, HookEventPayload, HookOutput};
+use crate::protocol::{HookEventKind, HookEventPayload, HookMatcherConfig, HookOutput};
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 type HookFn = Arc<dyn Fn(HookEventPayload) -> BoxFuture<HookOutput> + Send + Sync>;
 
-/// Registry of async hook handlers keyed by (event_kind, optional_matcher).
+#[derive(Clone)]
+struct Entry {
+    event: HookEventKind,
+    matcher: Option<String>,
+    timeout_s: Option<u32>,
+    handler: HookFn,
+}
+
+/// Registry of async hook handlers. Cheap to clone.
+#[derive(Clone, Default)]
 pub struct HookRegistry {
-    // key: "EventKind" or "EventKind:matcher"
-    handlers: RwLock<HashMap<String, Vec<HookFn>>>,
+    entries: Vec<Entry>,
+}
+
+impl fmt::Debug for HookRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.entries.iter().map(|e| (&e.event, &e.matcher)))
+            .finish()
+    }
 }
 
 impl HookRegistry {
     pub fn new() -> Self {
-        Self { handlers: RwLock::new(HashMap::new()) }
+        Self::default()
     }
 
     /// Register an async closure for a hook event.
     ///
-    /// ```rust
-    /// registry.on(HookEventKind::PreToolUse, None, |payload| async move {
-    ///     if payload.tool_name.as_deref() == Some("Bash") {
-    ///         HookOutput::allow()
-    ///     } else {
-    ///         HookOutput::block("only Bash is allowed")
-    ///     }
+    /// `matcher` filters by tool name for tool events (regex, e.g. `"Bash|Edit"`);
+    /// `None` matches everything.
+    ///
+    /// ```rust,no_run
+    /// # use claude_sdk::HookRegistry;
+    /// # use claude_sdk::protocol::{HookEventKind, HookOutput};
+    /// let mut hooks = HookRegistry::new();
+    /// hooks.on(HookEventKind::PreToolUse, Some("Bash"), |payload| async move {
+    ///     HookOutput::block("Bash is disabled")
     /// });
     /// ```
-    pub async fn on<F, Fut>(
-        &self,
-        event: HookEventKind,
-        matcher: Option<&str>,
-        handler: F,
-    )
+    pub fn on<F, Fut>(&mut self, event: HookEventKind, matcher: Option<&str>, handler: F) -> &mut Self
     where
         F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = HookOutput> + Send + 'static,
     {
-        let key = Self::key(&event, matcher);
-        let f: HookFn = Arc::new(move |p| Box::pin(handler(p)));
-        self.handlers.write().await.entry(key).or_default().push(f);
+        self.on_with_timeout(event, matcher, None, handler)
     }
 
-    /// Dispatch a callback_id to registered handlers.
-    /// callback_id format: `<instanceId>/<event>/<index>`
-    /// Source: chunk-mpj2xm2s.js:6
-    pub async fn dispatch(&self, callback_id: &str, payload: &HookEventPayload) -> HookOutput {
-        // Parse event kind from callback_id.
-        let event_part = callback_id.split('/').nth(1).unwrap_or("");
-        let event_kind_str = format!("{:?}", payload.hook_event_name); // debug == PascalCase
-
-        // Try exact match first, then event-only.
-        let keys = [
-            Self::key(&payload.hook_event_name, None),
-        ];
-        let handlers = self.handlers.read().await;
-        for key in &keys {
-            if let Some(fns) = handlers.get(key) {
-                // Run all handlers in order; first block wins.
-                for f in fns {
-                    let out = f(payload.clone()).await;
-                    if out.block_message.is_some() {
-                        return out;
-                    }
-                    // Accumulate watch_paths and additional_context from all handlers.
-                }
-                // Return the last output if no block.
-                if let Some(last) = fns.last() {
-                    return last(payload.clone()).await;
-                }
-            }
-        }
-        drop(handlers);
-        let _ = event_part;
-        let _ = event_kind_str;
-        HookOutput::allow()
+    /// Same as `on`, with a per-hook timeout in seconds enforced by the CLI.
+    pub fn on_with_timeout<F, Fut>(
+        &mut self,
+        event: HookEventKind,
+        matcher: Option<&str>,
+        timeout_s: Option<u32>,
+        handler: F,
+    ) -> &mut Self
+    where
+        F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = HookOutput> + Send + 'static,
+    {
+        let handler: HookFn = Arc::new(move |p| Box::pin(handler(p)));
+        self.entries.push(Entry {
+            event,
+            matcher: matcher.map(str::to_owned),
+            timeout_s,
+            handler,
+        });
+        self
     }
 
-    fn key(event: &HookEventKind, matcher: Option<&str>) -> String {
-        match matcher {
-            Some(m) => format!("{:?}:{}", event, m),
-            None => format!("{:?}", event),
-        }
-    }
-}
-
-impl Default for HookRegistry {
-    fn default() -> Self { Self::new() }
-}
-
-/// Convenience trait so external code can call `hooks.on_pre_tool_use(...)`.
-pub trait HookRegistryExt {
-    fn on_pre_tool_use<F, Fut>(&self, f: F) -> impl Future<Output = ()>
-    where F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
-          Fut: Future<Output = HookOutput> + Send + 'static;
-    fn on_stop<F, Fut>(&self, f: F) -> impl Future<Output = ()>
-    where F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
-          Fut: Future<Output = HookOutput> + Send + 'static;
-    fn on_user_prompt_submit<F, Fut>(&self, f: F) -> impl Future<Output = ()>
-    where F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
-          Fut: Future<Output = HookOutput> + Send + 'static;
-}
-
-impl HookRegistryExt for HookRegistry {
-    fn on_pre_tool_use<F, Fut>(&self, f: F) -> impl Future<Output = ()>
-    where F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
-          Fut: Future<Output = HookOutput> + Send + 'static
+    pub fn on_pre_tool_use<F, Fut>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = HookOutput> + Send + 'static,
     {
         self.on(HookEventKind::PreToolUse, None, f)
     }
 
-    fn on_stop<F, Fut>(&self, f: F) -> impl Future<Output = ()>
-    where F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
-          Fut: Future<Output = HookOutput> + Send + 'static
+    pub fn on_stop<F, Fut>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = HookOutput> + Send + 'static,
     {
         self.on(HookEventKind::Stop, None, f)
     }
 
-    fn on_user_prompt_submit<F, Fut>(&self, f: F) -> impl Future<Output = ()>
-    where F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
-          Fut: Future<Output = HookOutput> + Send + 'static
+    pub fn on_user_prompt_submit<F, Fut>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = HookOutput> + Send + 'static,
     {
         self.on(HookEventKind::UserPromptSubmit, None, f)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The `hooks` field of the initialize request.
+    pub fn initialize_config(&self) -> Option<HashMap<HookEventKind, Vec<HookMatcherConfig>>> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let mut config: HashMap<HookEventKind, Vec<HookMatcherConfig>> = HashMap::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            config.entry(e.event.clone()).or_default().push(HookMatcherConfig {
+                matcher: e.matcher.clone(),
+                hook_callback_ids: vec![callback_id(i)],
+                timeout: e.timeout_s,
+            });
+        }
+        Some(config)
+    }
+
+    /// Run the handler registered under `callback_id`.
+    /// Returns `None` when the id is unknown.
+    pub async fn dispatch(&self, callback_id: &str, payload: HookEventPayload) -> Option<HookOutput> {
+        let index: usize = callback_id.strip_prefix("hook_")?.parse().ok()?;
+        let entry = self.entries.get(index)?;
+        Some((entry.handler)(payload).await)
+    }
 }
 
-pub struct AllowAll;
-pub struct HookDispatcher;
+fn callback_id(index: usize) -> String {
+    format!("hook_{index}")
+}

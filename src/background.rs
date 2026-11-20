@@ -1,11 +1,10 @@
 /// Background task tree tracking.
 ///
 /// background_tasks_changed is a level signal (replace semantics).
-/// Source: chunk-20bv8pca.js:16351–16369 (M6 schema)
-///         chunk-20bv8pca.js:20970–20978 (background_tasks control request)
-use crate::protocol::{BackgroundTask, BackgroundTasksRequest};
-
-pub use crate::protocol::BackgroundTasksRequest as BackgroundTasksReq;
+/// Feed it `AgentEvent::BackgroundTasks`; background a running task with
+/// `session.control(&BackgroundTasksRequest::one(tool_use_id))`.
+/// Source: binary background_tasks_changed + background_tasks schemas
+use crate::protocol::BackgroundTask;
 
 /// Tracks the current agent task tree from background_tasks_changed events.
 #[derive(Default)]
@@ -25,7 +24,7 @@ impl TaskTree {
 
     /// Find a task by ID.
     pub fn get(&self, id: &str) -> Option<&BackgroundTask> {
-        self.tasks.iter().find(|t| t.id == id)
+        self.tasks.iter().find(|t| t.task_id == id)
     }
 
     /// All direct children of a parent task.

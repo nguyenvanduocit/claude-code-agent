@@ -75,55 +75,37 @@ Source: `chunk-20bv8pca.js` (Zod schema file, 20 000+ lines)
 
 ## Initialize Message (HIGH)
 
-Source: `chunk-20bv8pca.js:17716–17891` (`qfo` schema)
+Source: initialize zod schema in the 2.1.328 binary; claude_agent_sdk 0.1.48 `_internal/query.py:128–160`.
 
-Key fields (30+):
+The first stdin line (required by `--await-initialize`) is a control request:
 
-```rust
-pub struct Initialize {
-    pub api_key_source: ApiKeySource,
-    pub betas: Vec<String>,
-    pub capabilities: Vec<String>,
-    pub cwd: String,
-    pub hooks: Vec<HookConfig>,
-    pub mcp_server_manifests: Vec<McpManifest>,  // pre-load MCP to skip N×2 round-trips
-    pub model: String,
-    pub output_style: OutputStyle,
-    pub permission_mode: PermissionMode,
-    pub per_task_stop_affordance: bool,           // interrupt spares background agents
-    pub forward_nested_subagent_tool_calls: bool, // observe full agent tree
-    pub session_id: Option<String>,
-    pub skills: Vec<SkillConfig>,
-    pub tools: Vec<ToolDef>,                      // empty in SDK mode
-    pub plugins: Vec<PluginDef>,
-    // ... 15+ more
-}
+```json
+{"type":"control_request","request_id":"req_0_…","request":{
+  "subtype":"initialize",
+  "hooks":{"PreToolUse":[{"matcher":"Bash","hookCallbackIds":["hook_0"],"timeout":30}]},
+  "systemPrompt":"…","appendSystemPrompt":"…","agents":{…},"jsonSchema":{…}}}
 ```
 
-`per_task_stop_affordance` and `forward_nested_subagent_tool_calls` are unexposed by existing SDKs.
+The CLI answers `{"type":"control_response","response":{"subtype":"success","request_id":"req_0_…","response":{commands, models, account, …}}}`.
+`system/init` arrives only with the first user turn.
+
+Other top-level fields in the schema: `sdkMcpServers`, `sdkMcpServerConfigs`, `sdkMcpServerManifests`, `systemPromptSnapshot`, `planModeInstructions`, `appendSubagentSystemPrompt`, `toolAliases`, `codeRunningMcpTools`, `excludeDynamicSections`, `title`, `skills`, `promptSuggestions`, `agentProgressSummaries`, `forwardSubagentText`, `supportedDialogKinds`.
+cwd, model, permission mode and resume are process-level: cwd of the child, `--model`, `--permission-mode`, `--resume`.
 
 ---
 
 ## 33 Hook Types (HIGH)
 
-Source: `chunk-20bv8pca.js:12053–12087` (`N2` array)
+Source: hook event array in the 2.1.328 binary (diffed 33/33 against `HookEventKind`).
 
 ```
-PreToolUse  PostToolUse  PostToolUseFailure  PostToolBatch
-PreToolUseBash  PostCompact  PreCompact
-UserPromptSubmit  UserPromptExpansion
-Stop  StopFailure  SubagentStop  SubagentStart
-Notification
-Startup  StartupMetrics  StartupMcpServers
-FileChanged  CwdChanged  DirectoryChanged
-ConversationStored  ScratchpadUpdated
-AgentStarted  AgentStopped
-WorkspaceCreated  WorkspaceDestroyed
-ToolSearchAdded  ToolSearchRemoved
-Session  PeerMessage  PeerMessageHold
+PreToolUse  PostToolUse  PostToolUseFailure  PostToolBatch  Notification
+UserPromptSubmit  UserPromptExpansion  SessionStart  SessionEnd  Stop  StopFailure
+SubagentStart  SubagentStop  PreCompact  PostCompact  PreModelSwitch  PostModelSwitch
+PermissionRequest  PermissionDenied  Setup  TeammateIdle  TaskCreated  TaskCompleted
+Elicitation  ElicitationResult  ConfigChange  WorktreeCreate  WorktreeRemove
+InstructionsLoaded  CwdChanged  FileChanged  DirectoryAdded  MessageDisplay
 ```
-
-Existing SDKs expose 4–6 of these. This SDK exposes all 33.
 
 ### Hook Timeouts (HIGH)
 
@@ -138,21 +120,14 @@ Source: `chunk-0f728242.js:432–448`
 
 ### Hook Callback IPC (HIGH)
 
-Source: `chunk-20bv8pca.js:19959–19979`
+Source: binary hook_callback + hook-output schemas; `query.py:285–300, :325–345`. Verified end-to-end by `tests/integration_test.rs`.
 
-CLI calls back with a `hook_callback` control_request containing:
-- `event_name`, `tool_name`, `deadline_ms`
-- Hook handler returns `{ decision: "approve"|"deny"|"modify", reason?, modified_input? }`
+CLI → host: `{"type":"control_request","request_id":"…","request":{"subtype":"hook_callback","callback_id":"hook_0","input":{hook_event_name, tool_name, tool_input, …},"tool_use_id":"…"}}`
 
-```rust
-pub trait HookHandler: Send + Sync {
-    async fn handle(
-        &self,
-        event: HookEvent,
-        deadline: Duration,
-    ) -> HookDecision;
-}
-```
+Host → CLI: `{"type":"control_response","response":{"subtype":"success","request_id":"…","response":<hook output>}}`, where the hook output is the shell-hook JSON:
+`continue`, `suppressOutput`, `stopReason`, `decision` (`approve`|`block`), `systemMessage`, `reason`, `hookSpecificOutput` (`{hookEventName, additionalContext | watchPaths | …}`).
+
+`can_use_tool` (only with `--permission-prompt-tool stdio`) uses the same envelope; the answer is `{"behavior":"allow","updatedInput":{…}}` or `{"behavior":"deny","message":"…","interrupt"?}`.
 
 ### Device Hook Registration (HIGH)
 
@@ -245,58 +220,51 @@ When context nears the limit, the CLI fires a `PreCompact` hook before compactin
 claude-sdk-rs/
 ├── src/
 │   ├── lib.rs
-│   ├── codec.rs         # JSON codec for all 33+ message types
-│   ├── session.rs       # Persistent subprocess + readline loop
-│   ├── pool.rs          # Session pool, respawn on crash
-│   ├── hooks.rs         # HookHandler trait + 33 event types
-│   ├── middleware.rs    # tower-style hook middleware stack
-│   ├── tools.rs         # Tool definition + #[claude_tool] proc macro
-│   ├── background.rs    # background_tasks_changed stream
-│   ├── compaction.rs    # PreCompact hook + custom summarizer
-│   ├── tracing.rs       # OpenTelemetry spans per turn/hook
-│   └── replay.rs        # Record/replay for deterministic tests
-└── Cargo.toml
+│   ├── protocol.rs      # wire types (control envelopes, frames, hook I/O)
+│   ├── session.rs       # process transport + reader/writer/watchdog, answers control requests
+│   ├── agent.rs         # one prompt → AgentEvent stream, tracing span per turn
+│   ├── hooks.rs         # HookRegistry: async closures → initialize `hooks` + hook_callback
+│   ├── mcp.rs           # in-process MCP servers (SdkMcpServer, SdkTool) via mcp_message
+│   ├── pool.rs          # SessionPool: pre-warmed sessions, idle reuse
+│   ├── replay.rs        # record stdout to JSONL, replay without a process
+│   ├── compaction.rs    # /compact with custom instructions
+│   ├── background.rs    # TaskTree over background_tasks_changed snapshots
+│   ├── fs_events.rs     # FsEvent decoded from FileChanged/CwdChanged/DirectoryAdded
+│   └── middleware.rs    # ready-made hook policies (ToolAllowList)
+├── claude-sdk-macros/   # #[claude_tool] → <fn>_tool_def() + <fn>_tool()
+└── tests/               # integration_test.rs (live CLI, --ignored), replay_test.rs, macro_usage.rs
 ```
 
----
+## Observability
 
-## Implementation Phases
+The SDK emits `tracing` spans: `claude.turn` (cost_usd, input/output tokens, ttft_ms, error),
+`claude.hook` (callback_id, event, tool, blocked), `claude.tool` (server, method, tool).
+Export them with any subscriber, e.g. `tracing-opentelemetry` for OTLP.
 
-| Phase | Scope | Key deliverable |
-|---|---|---|
-| P1 | Codec + persistent session + streaming | `Session::query()` returns `impl Stream<Item=Message>` |
-| P2 | 33 hooks + `hook_callback` roundtrip | `HookHandler` trait, all 33 variants, deadlines enforced |
-| P3 | Session pool + auto-respawn | `SessionPool` with health checks |
-| P4 | Hook middleware stack | tower-compatible layer stack |
-| P5 | `#[claude_tool]` proc macro + FS events | `FileChanged`/`CwdChanged` reactive hooks |
-| P6 | Semantic compaction | `PreCompact` with summarizer session injection |
-| P7 | Subagent tree + `background_tasks` | Full agent tree observable via stream |
-| P8 | Record/replay | Deterministic test harness |
-| P9 | OpenTelemetry | Per-turn + per-hook spans |
+## Frame shapes (verified against the 2.1.328 binary and live output)
 
----
+`compact_boundary`, `model_fallback`, `background_tasks_changed`, `task_started`,
+`task_updated`, `task_notification`, `thinking_tokens`, `model_refusal_no_fallback`
+and `peer_message_hold` are all `{"type":"system","subtype":…}` frames.
+A `result` with an `origin` field (e.g. `{"kind":"task-notification"}`) closes a turn
+the CLI started itself; prompted turns have no `origin`.
 
-## Cargo.toml (skeleton)
+## Turn boundaries
 
-```toml
-[package]
-name = "claude-sdk"
-version = "0.1.0"
-edition = "2021"
+The CLI runs turns one after another; each ends with a `result`. The session runs with
+`--replay-user-messages`, and every prompt carries a `uuid`, which the CLI echoes
+(`isReplay: true`) inside that prompt's turn — first for a normal prompt, last for a
+slash command (`/compact` echoes after `compact_boundary`). A prompt's stream therefore
+holds frames since the previous `result` until its own echo arrives; a `result` before
+the echo closes another turn (a queued prompt, or one the CLI started itself after a
+background task finished) and the held frames are dropped.
 
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-futures = "0.3"
-thiserror = "1"
-tracing = "0.1"
-opentelemetry = { version = "0.22", optional = true }
+## Lifecycle
 
-[dev-dependencies]
-tokio-test = "0.4"
-```
+The Session owns the only strong stdin sender and the reader task owns the only strong
+event sender. `close()` (or dropping the last Session clone) closes stdin, so the CLI
+exits; `close()` waits for the exit and returns the code. When the CLI's stdout ends,
+the event channel closes and in-flight streams end with `Error`.
 
 ---
 

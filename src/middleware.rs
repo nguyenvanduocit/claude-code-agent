@@ -1,30 +1,41 @@
-/// Tower-style hook middleware stack.
-///
-/// Composable layers that wrap the HookRegistry.
-/// Each layer receives the HookEventPayload and can:
-///   - Short-circuit with HookOutput::block(...)
-///   - Mutate and pass through
-///   - Log, rate-limit, audit, etc.
+/// Ready-made hook policies.
+use crate::hooks::HookRegistry;
 use crate::protocol::{HookEventKind, HookOutput};
 
-/// A no-op middleware placeholder.
-/// Real implementations register async closures via HookRegistry.
-pub struct MiddlewareStack;
-pub struct LoggingMiddleware;
+/// Block every tool call whose tool is not in the list (PreToolUse hook).
+///
+/// ```rust,no_run
+/// use claude_sdk::HookRegistry;
+/// use claude_sdk::middleware::ToolAllowList;
+///
+/// let mut hooks = HookRegistry::new();
+/// ToolAllowList::new(["Read", "Grep", "Glob"]).install(&mut hooks);
+/// ```
+#[derive(Debug, Clone)]
 pub struct ToolAllowList {
     pub allowed: Vec<String>,
 }
 
 impl ToolAllowList {
     pub fn new(tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self { allowed: tools.into_iter().map(|s| s.into()).collect() }
+        Self { allowed: tools.into_iter().map(Into::into).collect() }
     }
-}
 
-/// Middleware trait — register via HookRegistry::on().
-pub trait HookMiddleware: Send + Sync {
-    fn on_event(
-        &self,
-        payload: &crate::protocol::HookEventPayload,
-    ) -> Option<HookOutput>;
+    pub fn allows(&self, tool: &str) -> bool {
+        self.allowed.iter().any(|t| t == tool)
+    }
+
+    /// Register the PreToolUse hook that enforces the list.
+    pub fn install(self, hooks: &mut HookRegistry) {
+        hooks.on(HookEventKind::PreToolUse, None, move |payload| {
+            let verdict = match payload.tool_name.as_deref() {
+                Some(tool) if !self.allows(tool) => Some(format!(
+                    "Tool {tool} is not allowed here. Allowed tools: {}",
+                    self.allowed.join(", ")
+                )),
+                _ => None,
+            };
+            async move { verdict.map(HookOutput::block).unwrap_or_else(HookOutput::allow) }
+        });
+    }
 }
