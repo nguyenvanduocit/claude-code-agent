@@ -37,7 +37,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           for crate in claude-code-agent-macros claude-code-agent; do
-            if curl -sf -A "claude-code-agent-release (github.com/nguyenvanduocit/claude-sdk-rs)" \
+            if curl -sf -A "claude-code-agent-release (github.com/nguyenvanduocit/claude-code-agent)" \
                 "https://crates.io/api/v1/crates/$crate/$VERSION" > /dev/null; then
               echo "$crate $VERSION is already on crates.io"
             else

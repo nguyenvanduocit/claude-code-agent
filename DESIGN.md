@@ -26,7 +26,7 @@ claude --output-format stream-json \
 - One long-lived process per session. Stdin/stdout are newline-delimited JSON.
 - Send a query by writing `{"type":"user","message":{"role":"user","content":[...]},"uuid":"…"}` + `\n`; the `uuid` marks the turn (see Turn boundaries).
 - `--await-initialize` makes the CLI wait for the `initialize` control request before anything else.
-- `Session` is `Arc<SessionInner>` with three tasks: writer (stdin), reader (stdout → subscribers, answers control requests), watchdog (exit + stderr tail). See Lifecycle.
+- `Session` is `Arc<SessionInner>` with three tasks: writer (stdin), reader (stdout → subscribers, answers control requests), watchdog (waits for the CLI process to exit, then reports the stderr tail). See Lifecycle.
 
 ---
 
@@ -153,7 +153,7 @@ never get the `REPL` tool. The check also refuses:
 2. Make same-length edits to its source. The eligibility check returns early, the
    caveats count as accepted, and the gate counts as open. Each anchor is a regex
    over minified names and must match exactly once, otherwise spawning fails with
-   `CodeModeError::Anchor`.
+   `CodeModeError::AnchorCount`.
 3. Zero the module's bytecode pointer. Bun runs the precompiled JSC bytecode when
    it is present, and the bytecode ignores source edits (verified). With the
    pointer zeroed, Bun compiles the patched source.
@@ -255,14 +255,29 @@ background tasks) are in that group too. The Session owns the only strong stdin
 sender. `close()` closes stdin and waits up to 5 s for the CLI to exit; a CLI kept
 alive by background tasks then gets SIGTERM, then SIGKILL, sent to the whole group,
 and a final SIGTERM to the group ends leftover children. Dropping the last Session
-clone sends SIGTERM to the group if the CLI is still running. On Windows the same
-steps use `taskkill /T /F` on the CLI's process tree.
+clone sends SIGTERM to the group if the CLI is still running, and SIGKILL 5 s later
+if it still is (when a Tokio runtime is there to wait). On Windows the same steps
+use `taskkill /T /F` on the CLI's process tree.
+
+Exit is detected from the process, not from stderr EOF: a tool the CLI started can
+inherit stderr and hold it open after the CLI is gone. stderr drains in its own task;
+after the exit it gets 500 ms to deliver its last lines. A panicking `on_stderr` is
+logged and the drain continues.
+
+When stdout ends, or the reader task panics, a drop guard ends every subscriber
+stream, fails every pending control request, and aborts the handlers still running
+for the CLI's control requests (a `can_use_tool` waiting on a UI has no CLI left to
+answer). Handlers are owned by the session, so one that captures a `Session` keeps it
+alive forever; handlers capture `Session::downgrade()` instead.
 
 ## Event fanout
 
 The reader task sends each frame to every subscriber through its own unbounded
 channel. No frame is dropped for a slow consumer: a lost echo or `result` would hang
-the turn. When stdout ends, all subscriber channels close and in-flight streams end
+the turn. The cost is memory: a subscriber that is never polled buffers every frame,
+so `subscribe()` and `Agent::watch()` streams are polled or dropped. A frame of a
+known type that fails to decode is delivered as `InboundMessage::Other` with its raw
+JSON; an undecodable `result` still ends its turn. When stdout ends, all subscriber channels close and in-flight streams end
 with `Error`. Assistant frames with `parent_tool_use_id` belong to a subagent and are
 not turned into the parent turn's `AgentEvent`s.
 

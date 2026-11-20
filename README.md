@@ -8,7 +8,7 @@ You need the Claude Code CLI 2.1.329 or newer, installed and logged in. `Session
 
 ```toml
 [dependencies]
-claude-code-agent = "0.6"
+claude-code-agent = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 ```
@@ -223,7 +223,7 @@ Runnable programs for each feature are in `examples/`.
 
 ## Limitations
 
-- A Claude Code update can break Code Mode until the SDK is updated; spawning then fails with `CodeModeError::Anchor`.
+- A Claude Code update can break Code Mode until the SDK is updated; spawning then fails with `CodeModeError::AnchorCount`.
 - Tools from servers added with `set_mcp_servers` still need permission (`permission_mode` or `can_use_tool`).
 - `session.mcp_call` and `mcp_read_resource` work only with external MCP servers.
 - `set_system_prompt` works only on your account's default model; use `set_model_and_system_prompt` otherwise.
@@ -235,7 +235,7 @@ Runnable programs for each feature are in `examples/`.
 Release: bump `version` in both `Cargo.toml` files (and the dependency on `claude-code-agent-macros`), push to `main`, then push the matching tag:
 
 ```sh
-git tag -a v0.6.2 -m v0.6.2 && git push origin v0.6.2
+git tag -a v0.7.0 -m v0.7.0 && git push origin v0.7.0
 ```
 
 `.github/workflows/release.yml` runs the tests on Linux, macOS and Windows, then publishes both crates to crates.io. No token is stored; crates.io trusts the workflow directly.

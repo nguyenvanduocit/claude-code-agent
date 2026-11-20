@@ -21,7 +21,7 @@
 //! trailer `"\n---- Bun! ----\n"` preceded by a 32-byte offsets struct
 //! (`byte_count: u64, modules: (u32 offset, u32 len), …`); the module list
 //! is 52-byte entries of six `(u32 offset, u32 len)` pointers (name,
-//! contents, sourcemap, bytecode, module_info, bytecode_origin_path) plus
+//! contents, sourcemap, bytecode, `module_info`, `bytecode_origin_path`) plus
 //! four flag bytes; offsets are relative to `trailer - 32 - byte_count`.
 use std::path::{Path, PathBuf};
 
@@ -35,20 +35,62 @@ const BYTECODE_PTR: usize = 24;
 /// Present only in the Code Mode opt-in module.
 const MODULE_MARKER: &[u8] = b"\"tengu_rustling_blossom\"";
 
+/// How long one `codesign` run may take before the build is abandoned.
+#[cfg(target_os = "macos")]
+const CODESIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Error building the Code Mode binary.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CodeModeError {
+    /// The CLI binary is not a Bun standalone executable this patch can
+    /// read; the payload names the check that failed.
     #[error("not a Bun standalone binary: {0}")]
     NotBunBinary(&'static str),
+    /// No module contains the Code Mode opt-in marker.
     #[error("Code Mode module not found in the CLI binary")]
     ModuleNotFound,
-    #[error("patch anchor `{0}` found {1} times (expected 1); this CLI version is not supported")]
-    Anchor(&'static str, usize),
+    /// A patch anchor's regex does not compile.
+    #[error("patch anchor `{name}` has an invalid pattern: {source}")]
+    PatternInvalid {
+        /// Anchor name.
+        name: &'static str,
+        /// The regex error.
+        #[source]
+        source: regex::Error,
+    },
+    /// A patch anchor did not match exactly once.
+    #[error("patch anchor `{name}` found {found} times (expected 1); this CLI version is not supported")]
+    AnchorCount {
+        /// Anchor name.
+        name: &'static str,
+        /// Number of matches.
+        found: usize,
+    },
+    /// A patch anchor matched fewer bytes than its replacement needs.
+    #[error(
+        "patch anchor `{name}` matched {matched} bytes, fewer than its {replacement}-byte replacement; \
+         this CLI version is not supported"
+    )]
+    ReplacementTooShort {
+        /// Anchor name.
+        name: &'static str,
+        /// Length of the match, in bytes.
+        matched: usize,
+        /// Length of the replacement, in bytes.
+        replacement: usize,
+    },
+    /// A filesystem operation on the CLI binary or its patched copy failed,
+    /// or `codesign` could not run or timed out.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// `codesign` failed on the patched binary (macOS).
     #[error("re-signing the patched CLI failed: {0}")]
     Sign(String),
+    /// `SessionOptions::settings` (or its `env`) is not a JSON object.
     #[error("`settings` must be a JSON object (with an object `env`) to add the Code Mode env var")]
     Settings,
+    /// Code Mode was requested on a platform other than macOS or Linux.
     #[error("Code Mode is supported on macOS and Linux only")]
     UnsupportedPlatform,
 }
@@ -61,12 +103,8 @@ pub fn patch(binary: &[u8]) -> Result<Vec<u8>, CodeModeError> {
     let (entry, contents) = find_module(&out)?;
 
     let module = &out[contents.clone()];
-    let gate_var = Regex::new(r#"var ([\w$]+)="tengu_rustling_blossom""#)
-        .ok()
-        .and_then(|re| re.captures(module))
-        .and_then(|c| c.get(1))
-        .map(|m| regex::escape(&String::from_utf8_lossy(m.as_bytes())))
-        .ok_or(CodeModeError::Anchor("gate variable", 0))?;
+    let gate_var = unique_match(module, "gate variable", r#"var ([\w$]+)="tengu_rustling_blossom""#)?;
+    let gate_var = regex::escape(&String::from_utf8_lossy(&module[gate_var]));
 
     let edits: [(&'static str, String, &[u8]); 3] = [
         ("eligibility", r#"(?:\{)(if\(![\w$]+\(\)\)return"runtime";)"#.into(), b"return;"),
@@ -80,7 +118,7 @@ pub fn patch(binary: &[u8]) -> Result<Vec<u8>, CodeModeError> {
     for (name, pattern, replacement) in edits {
         let span = unique_match(&out[contents.clone()], name, &pattern)?;
         if span.len() < replacement.len() {
-            return Err(CodeModeError::Anchor(name, 1));
+            return Err(CodeModeError::ReplacementTooShort { name, matched: span.len(), replacement: replacement.len() });
         }
         let start = contents.start + span.start;
         overwrite_padded(&mut out[start..start + span.len()], replacement);
@@ -116,11 +154,11 @@ fn find_module(data: &[u8]) -> Result<(usize, std::ops::Range<usize>), CodeModeE
 
 /// Range (within `haystack`) of capture group 1 of the only match.
 fn unique_match(haystack: &[u8], name: &'static str, pattern: &str) -> Result<std::ops::Range<usize>, CodeModeError> {
-    let re = Regex::new(pattern).map_err(|_| CodeModeError::Anchor(name, 0))?;
+    let re = Regex::new(pattern).map_err(|source| CodeModeError::PatternInvalid { name, source })?;
     let found: Vec<_> = re.captures_iter(haystack).filter_map(|c| c.get(1)).map(|m| m.range()).collect();
     match found.as_slice() {
         [one] => Ok(one.clone()),
-        _ => Err(CodeModeError::Anchor(name, found.len())),
+        _ => Err(CodeModeError::AnchorCount { name, found: found.len() }),
     }
 }
 
@@ -191,7 +229,7 @@ pub async fn patched_binary(binary: &Path) -> Result<PathBuf, CodeModeError> {
         tokio::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)).await?;
     }
     if let Err(e) = sign(&partial, &source).await {
-        let _ = tokio::fs::remove_file(&partial).await;
+        remove_leftover(&partial).await;
         return Err(e);
     }
     tokio::fs::rename(&partial, &target).await?;
@@ -211,7 +249,7 @@ async fn source_key(source: &Path) -> std::io::Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "claude".into());
+    let name = source.file_name().map_or_else(|| "claude".into(), |n| n.to_string_lossy().into_owned());
     Ok(format!("{name}-{}-{mtime}", meta.len()))
 }
 
@@ -259,6 +297,15 @@ fn resolve(binary: &Path) -> PathBuf {
         .unwrap_or_else(|| binary.to_path_buf())
 }
 
+/// Best-effort delete of a temporary file; a failure only leaves litter.
+async fn remove_leftover(path: &Path) {
+    if let Err(e) = tokio::fs::remove_file(path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), error = %e, "could not remove temporary Code Mode file");
+    }
+}
+
 fn cache_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -271,8 +318,7 @@ fn cache_dir() -> PathBuf {
 /// entitlements (JIT, unsigned executable memory) must carry over.
 #[cfg(target_os = "macos")]
 async fn sign(patched: &Path, source: &Path) -> Result<(), CodeModeError> {
-    use tokio::process::Command;
-    let ents = Command::new("codesign").args(["-d", "--entitlements", "-", "--xml"]).arg(source).output().await?;
+    let ents = codesign(|c| c.args(["-d", "--entitlements", "-", "--xml"]).arg(source)).await?;
     if !ents.status.success() || !ents.stdout.starts_with(b"<?xml") {
         return Err(CodeModeError::Sign(format!(
             "could not read entitlements of {}: {}",
@@ -282,18 +328,31 @@ async fn sign(patched: &Path, source: &Path) -> Result<(), CodeModeError> {
     }
     let plist = patched.with_extension("entitlements.plist");
     tokio::fs::write(&plist, &ents.stdout).await?;
-    let out = Command::new("codesign")
-        .args(["--force", "--sign", "-", "--timestamp=none", "--entitlements"])
-        .arg(&plist)
-        .arg(patched)
-        .output()
-        .await?;
-    let _ = tokio::fs::remove_file(&plist).await;
+    let out = codesign(|c| {
+        c.args(["--force", "--sign", "-", "--timestamp=none", "--entitlements"]).arg(&plist).arg(patched)
+    })
+    .await;
+    remove_leftover(&plist).await;
+    let out = out?;
     if out.status.success() {
         Ok(())
     } else {
         Err(CodeModeError::Sign(String::from_utf8_lossy(&out.stderr).trim().to_string()))
     }
+}
+
+/// Run `codesign` with the arguments `args` adds, killed after [`CODESIGN_TIMEOUT`]
+/// (the caller holds the build lock).
+#[cfg(target_os = "macos")]
+async fn codesign(
+    args: impl FnOnce(&mut tokio::process::Command) -> &mut tokio::process::Command,
+) -> Result<std::process::Output, CodeModeError> {
+    let mut cmd = tokio::process::Command::new("codesign");
+    args(&mut cmd).kill_on_drop(true);
+    tokio::time::timeout(CODESIGN_TIMEOUT, cmd.output()).await.map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("codesign timed out after {CODESIGN_TIMEOUT:?}"))
+    })?
+    .map_err(CodeModeError::from)
 }
 
 #[cfg(not(target_os = "macos"))]

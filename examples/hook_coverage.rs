@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let mut hooks = HookRegistry::new();
     for event in ALL {
         let fired = fired.clone();
-        hooks.on(event.clone(), None, move |p| {
+        hooks.on(event, None, move |p| {
             if let Ok(mut f) = fired.lock() {
                 *f.entry(format!("{:?}", p.hook_event_name)).or_default() += 1;
             }

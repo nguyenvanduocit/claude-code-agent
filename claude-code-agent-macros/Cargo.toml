@@ -1,10 +1,11 @@
 [package]
 name = "claude-code-agent-macros"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Proc macros for claude-code-agent — #[claude_tool] generates ToolDef from async fn signatures"
 license = "MIT"
-repository = "https://github.com/nguyenvanduocit/claude-sdk-rs"
+repository = "https://github.com/nguyenvanduocit/claude-code-agent"
 
 [lib]
 proc-macro = true

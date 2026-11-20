@@ -1,11 +1,11 @@
 [package]
 name = "claude-code-agent"
-version = "0.6.1"
+version = "0.7.0"
 rust-version = "1.88"
 edition = "2024"
 description = "Rust SDK for Claude Code — persistent subprocess, hook callbacks, in-process tools, record/replay"
 license = "MIT"
-repository = "https://github.com/nguyenvanduocit/claude-sdk-rs"
+repository = "https://github.com/nguyenvanduocit/claude-code-agent"
 readme = "README.md"
 keywords = ["claude", "claude-code", "anthropic", "agent", "sdk"]
 categories = ["api-bindings", "asynchronous"]
@@ -26,11 +26,11 @@ thiserror    = "2"
 tracing      = "0.1"
 dashmap      = "6"
 
-claude-code-agent-macros      = { version = "0.6.1", path = "claude-code-agent-macros", optional = true }
+claude-code-agent-macros      = { version = "0.7.0", path = "claude-code-agent-macros", optional = true }
 
 tokio-stream = "0.1.19"
 async-stream = "0.3.6"
-uuid = { version = "1.29.3", features = ["v4"] }
+uuid = { version = "1", features = ["v4"] }
 regex = { version = "1.13.2", default-features = false, features = ["std", "perf", "unicode-perl"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -40,7 +40,7 @@ nix = { version = "0.32.0", features = ["signal"] }
 tokio             = { version = "1", features = ["full"] }
 anyhow            = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-claude-code-agent-macros = { version = "0.6.1", path = "claude-code-agent-macros" }
+claude-code-agent-macros = { version = "0.7.0", path = "claude-code-agent-macros" }
 
 [[example]]
 name = "tools"

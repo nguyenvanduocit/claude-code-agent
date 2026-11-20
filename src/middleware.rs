@@ -2,7 +2,7 @@
 use crate::hooks::HookRegistry;
 use crate::protocol::{HookEventKind, HookOutput};
 
-/// Block every tool call whose tool is not in the list (PreToolUse hook).
+/// Block every tool call whose tool is not in the list (`PreToolUse` hook).
 ///
 /// ```rust,no_run
 /// use claude_code_agent::HookRegistry;
@@ -13,19 +13,23 @@ use crate::protocol::{HookEventKind, HookOutput};
 /// ```
 #[derive(Debug, Clone)]
 pub struct ToolAllowList {
+    /// Names of the allowed tools.
     pub allowed: Vec<String>,
 }
 
 impl ToolAllowList {
+    /// Allow exactly `tools`.
     pub fn new(tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self { allowed: tools.into_iter().map(Into::into).collect() }
     }
 
+    /// Whether `tool` is in the list.
+    #[must_use]
     pub fn allows(&self, tool: &str) -> bool {
         self.allowed.iter().any(|t| t == tool)
     }
 
-    /// Register the PreToolUse hook that enforces the list.
+    /// Register the `PreToolUse` hook that enforces the list.
     pub fn install(self, hooks: &mut HookRegistry) {
         hooks.on(HookEventKind::PreToolUse, None, move |payload| {
             let verdict = match payload.tool_name.as_deref() {
@@ -35,7 +39,7 @@ impl ToolAllowList {
                 )),
                 _ => None,
             };
-            async move { verdict.map(HookOutput::block).unwrap_or_else(HookOutput::allow) }
+            async move { verdict.map_or_else(HookOutput::allow, HookOutput::block) }
         });
     }
 }

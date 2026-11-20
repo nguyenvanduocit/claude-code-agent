@@ -6,7 +6,7 @@
 //!
 //! Each `on()` call becomes one matcher with one callback id `hook_<n>`; when
 //! the hook fires the CLI sends `hook_callback { callback_id: "hook_<n>" }`.
-//! Source: claude_agent_sdk 0.1.48 _internal/query.py:128–147, :285–300
+//! Source: `claude_agent_sdk` 0.1.48 _internal/query.py:128–147, :285–300
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -41,6 +41,8 @@ impl fmt::Debug for HookRegistry {
 }
 
 impl HookRegistry {
+    /// An empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -88,6 +90,7 @@ impl HookRegistry {
         self
     }
 
+    /// `on(PreToolUse, None, f)`: runs before every tool call.
     pub fn on_pre_tool_use<F, Fut>(&mut self, f: F) -> &mut Self
     where
         F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
@@ -96,6 +99,7 @@ impl HookRegistry {
         self.on(HookEventKind::PreToolUse, None, f)
     }
 
+    /// `on(Stop, None, f)`.
     pub fn on_stop<F, Fut>(&mut self, f: F) -> &mut Self
     where
         F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
@@ -104,6 +108,7 @@ impl HookRegistry {
         self.on(HookEventKind::Stop, None, f)
     }
 
+    /// `on(UserPromptSubmit, None, f)`.
     pub fn on_user_prompt_submit<F, Fut>(&mut self, f: F) -> &mut Self
     where
         F: Fn(HookEventPayload) -> Fut + Send + Sync + 'static,
@@ -112,18 +117,21 @@ impl HookRegistry {
         self.on(HookEventKind::UserPromptSubmit, None, f)
     }
 
+    /// Whether no hook is registered.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// The `hooks` field of the initialize request.
+    #[must_use]
     pub fn initialize_config(&self) -> Option<HashMap<HookEventKind, Vec<HookMatcherConfig>>> {
         if self.entries.is_empty() {
             return None;
         }
         let mut config: HashMap<HookEventKind, Vec<HookMatcherConfig>> = HashMap::new();
         for (i, e) in self.entries.iter().enumerate() {
-            config.entry(e.event.clone()).or_default().push(HookMatcherConfig {
+            config.entry(e.event).or_default().push(HookMatcherConfig {
                 matcher: e.matcher.clone(),
                 hook_callback_ids: vec![callback_id(i)],
                 timeout: e.timeout_s,

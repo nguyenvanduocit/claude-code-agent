@@ -1,4 +1,4 @@
-//! Typed filesystem events from FileChanged / CwdChanged / DirectoryAdded hooks.
+//! Typed filesystem events from `FileChanged` / `CwdChanged` / `DirectoryAdded` hooks.
 //!
 //! Register a hook, then decode its payload:
 //!
@@ -19,25 +19,43 @@
 //! });
 //! ```
 //!
-//! Limitation (verified against 2.1.328): the CLI delivers CwdChanged and
-//! FileChanged to shell hooks declared in settings (`SessionOptions::settings`)
+//! Limitation (verified against 2.1.328): the CLI delivers `CwdChanged` and
+//! `FileChanged` to shell hooks declared in settings (`SessionOptions::settings`)
 //! but not to SDK hook callbacks. Use `FsEvent::from_payload` on the JSON a
 //! settings hook receives, or on payloads from a CLI version that forwards them.
 //!
-//! Source: binary hook input schemas (FileChanged: file_path, event;
-//! CwdChanged: old_cwd, new_cwd; DirectoryAdded: directory)
+//! Source: binary hook input schemas (`FileChanged`: `file_path`, event;
+//! `CwdChanged`: `old_cwd`, `new_cwd`; `DirectoryAdded`: directory)
 use crate::protocol::{HookEventKind, HookEventPayload};
 
+/// A filesystem hook event, decoded from its payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FsEvent {
     /// `event`: "change" | "add" | "unlink"
-    FileChanged { path: String, event: String },
-    CwdChanged { old_cwd: String, new_cwd: String },
-    DirectoryAdded { directory: String },
+    FileChanged {
+        /// The changed file (`file_path`).
+        path: String,
+        /// What happened to it.
+        event: String,
+    },
+    /// The working directory changed.
+    CwdChanged {
+        /// Previous working directory.
+        old_cwd: String,
+        /// New working directory.
+        new_cwd: String,
+    },
+    /// A directory was added (`DirectoryAdded`).
+    DirectoryAdded {
+        /// The added directory.
+        directory: String,
+    },
 }
 
 impl FsEvent {
     /// Decode a hook payload; `None` for other events or missing fields.
+    #[must_use]
     pub fn from_payload(p: &HookEventPayload) -> Option<Self> {
         let extra = |k: &str| p.extra.get(k).and_then(|v| v.as_str()).map(str::to_owned);
         match p.hook_event_name {

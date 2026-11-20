@@ -108,6 +108,7 @@
 //! ```
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod agent;
@@ -152,7 +153,7 @@ pub use protocol::{
 };
 pub use session::{
     CanUseTool, McpCall, OnElicitation, OnStderr, OnUserDialog, ReloadPlugins, Session, SessionError,
-    SessionOptions,
+    SessionOptions, WeakSession,
 };
 
 /// Re-exports used by code generated from `#[claude_tool]`. Not public API.

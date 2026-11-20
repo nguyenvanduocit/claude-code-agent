@@ -1,14 +1,14 @@
 //! Persistent subprocess session — 3-task architecture.
 //!
-//!   reader_task   — reads stdout; answers CLI control requests (hooks,
-//!                   can_use_tool, mcp_message), routes control responses to
+//!   `reader_task`   — reads stdout; answers CLI control requests (hooks,
+//!                   `can_use_tool`, `mcp_message`), routes control responses to
 //!                   waiters, fans every other frame out to all subscribers
 //!                   (one unbounded channel each: no frame is ever dropped)
-//!   writer_task   — drains the stdin channel into the subprocess
-//!   watchdog_task — waits for exit, marks the session dead, keeps stderr tail
+//!   `writer_task`   — drains the stdin channel into the subprocess
+//!   `watchdog_task` — waits for exit, marks the session dead, keeps stderr tail
 //!
-//! Wire protocol verified against claude_agent_sdk 0.1.48
-//! (_internal/query.py, _internal/transport/subprocess_cli.py) and a live
+//! Wire protocol verified against `claude_agent_sdk` 0.1.48
+//! (_internal/query.py, _`internal/transport/subprocess_cli.py`) and a live
 //! Claude Code 2.1.329 binary.
 use std::collections::VecDeque;
 use std::fmt;
@@ -39,26 +39,56 @@ use crate::protocol::{
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
+/// Error of a session operation.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SessionError {
+    /// An I/O error, e.g. spawning the CLI or opening a recording file.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A frame could not be serialized or parsed.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// The CLI process exited.
     #[error("process exited (code: {code:?}); stderr tail:\n{stderr}")]
-    ProcessExited { code: Option<i32>, stderr: String },
+    ProcessExited {
+        /// Exit code; `None` when killed by a signal.
+        code: Option<i32>,
+        /// Last lines the CLI wrote to stderr.
+        stderr: String,
+    },
+    /// The session was closed, or stdin is gone.
     #[error("session closed")]
     Closed,
+    /// The CLI answered a control request with an error.
     #[error("control request `{subtype}` failed: {error}")]
-    ControlError { subtype: String, error: String },
+    ControlError {
+        /// The request's `subtype`.
+        subtype: String,
+        /// The CLI's error message.
+        error: String,
+    },
+    /// No answer to the control request (named by its `subtype`) in time
+    /// (`SessionOptions::control_timeout` for requests after initialize).
     #[error("control request `{0}` timed out")]
     ControlTimeout(String),
+    /// Building the Code Mode binary failed.
     #[error("code mode: {0}")]
     CodeMode(#[from] crate::code_mode::CodeModeError),
+    /// The CLI is older than `MIN_CLI_VERSION`.
     #[error("Claude Code {found} is older than {min}, the oldest version this SDK supports; run `claude update`")]
-    UnsupportedCliVersion { found: String, min: &'static str },
+    UnsupportedCliVersion {
+        /// Version the CLI reported.
+        found: String,
+        /// `MIN_CLI_VERSION`.
+        min: &'static str,
+    },
+    /// A recording passed to `replay` that cannot be replayed.
+    #[error("invalid recording: {0}")]
+    InvalidRecording(String),
 }
 
+/// `Result` with `SessionError`.
 pub type Result<T> = std::result::Result<T, SessionError>;
 
 const STATE_RUNNING: u8 = 0;
@@ -66,6 +96,8 @@ const STATE_CLOSING: u8 = 1;
 const STATE_DEAD: u8 = 2;
 
 const STDERR_TAIL_LINES: usize = 40;
+/// After the CLI exits, how long stderr may still deliver its last lines.
+const STDERR_LINGER: Duration = Duration::from_millis(500);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default of `SessionOptions::control_timeout`.
 pub const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -84,6 +116,7 @@ type PermFuture = Pin<Box<dyn Future<Output = ToolDecision> + Send + 'static>>;
 pub struct CanUseTool(Arc<dyn Fn(CanUseToolRequest) -> PermFuture + Send + Sync>);
 
 impl CanUseTool {
+    /// Wrap an async handler.
     pub fn new<F, Fut>(f: F) -> Self
     where
         F: Fn(CanUseToolRequest) -> Fut + Send + Sync + 'static,
@@ -101,6 +134,7 @@ type ElicitFuture = Pin<Box<dyn Future<Output = ElicitationResponse> + Send + 's
 pub struct OnElicitation(Arc<dyn Fn(ElicitationRequest) -> ElicitFuture + Send + Sync>);
 
 impl OnElicitation {
+    /// Wrap an async handler.
     pub fn new<F, Fut>(f: F) -> Self
     where
         F: Fn(ElicitationRequest) -> Fut + Send + Sync + 'static,
@@ -120,6 +154,7 @@ type DialogFuture = Pin<Box<dyn Future<Output = UserDialogResponse> + Send + 'st
 pub struct OnUserDialog(Arc<dyn Fn(UserDialogRequest) -> DialogFuture + Send + Sync>);
 
 impl OnUserDialog {
+    /// Wrap an async handler.
     pub fn new<F, Fut>(f: F) -> Self
     where
         F: Fn(UserDialogRequest) -> Fut + Send + Sync + 'static,
@@ -134,6 +169,7 @@ impl OnUserDialog {
 pub struct OnStderr(Arc<dyn Fn(&str) + Send + Sync>);
 
 impl OnStderr {
+    /// Wrap a callback.
     pub fn new(f: impl Fn(&str) + Send + Sync + 'static) -> Self {
         Self(Arc::new(f))
     }
@@ -175,8 +211,10 @@ macro_rules! opaque_debug {
 }
 opaque_debug!(CanUseTool, OnElicitation, OnUserDialog, OnStderr);
 
+/// How to spawn and configure the CLI process.
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
+    /// Path of the `claude` executable. Default: `claude` (looked up on `PATH`).
     pub binary: PathBuf,
     /// Working directory of the CLI process. `None` = inherit.
     pub cwd: Option<PathBuf>,
@@ -225,7 +263,7 @@ pub struct SessionOptions {
     /// SDK sessions, so this runs a patched copy of `binary`, built once and
     /// cached (see `code_mode` module); the installed CLI is not modified.
     pub code_mode: bool,
-    /// Enable tool search: sets ENABLE_TOOL_SEARCH=1.
+    /// Enable tool search: sets `ENABLE_TOOL_SEARCH=1`.
     /// Source: chunk-dnmy4w56.js:189
     pub tool_search: bool,
     /// Stream partial chunks (`--include-partial-messages`).
@@ -233,7 +271,7 @@ pub struct SessionOptions {
     /// Hook handlers, sent to the CLI in the initialize request.
     pub hooks: HookRegistry,
     /// Tool-permission handler; adds `--permission-prompt-tool stdio`.
-    /// Source: subprocess_cli.py:218
+    /// Source: `subprocess_cli.py:218`
     pub can_use_tool: Option<CanUseTool>,
     /// In-process tool servers. Their tools are added to `allowed_tools`
     /// automatically: the host defined them, so asking permission is noise.
@@ -277,11 +315,11 @@ pub struct SessionOptions {
     /// skills, plugins, hooks, MCP servers, …).
     pub safe_mode: bool,
     /// `--restricted`: remove the built-in tools that run commands or code,
-    /// and WebFetch, unless `tools` names them.
+    /// and `WebFetch`, unless `tools` names them.
     pub restricted: bool,
     /// `--disable-slash-commands`: no skills or commands.
     pub disable_slash_commands: bool,
-    /// `--brief`: give Claude the SendUserMessage tool.
+    /// `--brief`: give Claude the `SendUserMessage` tool.
     pub brief: bool,
     /// `--include-hook-events`: emit hook lifecycle frames
     /// (`AgentEvent::System`).
@@ -302,7 +340,7 @@ pub struct SessionOptions {
     /// "local"). `Some(vec![])` loads none — the session ignores the user's
     /// global CLAUDE.md, skills, permission rules and hooks, and turns get
     /// much cheaper. `None` = CLI default (all).
-    /// Source: subprocess_cli.py:275–280
+    /// Source: `subprocess_cli.py:275–280`
     pub setting_sources: Option<Vec<String>>,
     /// `--settings`: inline settings object (permissions, env, shell `hooks`, …),
     /// or a string: path of a settings file (relative to `cwd`). With
@@ -420,8 +458,29 @@ pub(crate) struct Transport {
 }
 
 /// A live Claude Code session. Cheap to clone — backed by `Arc<SessionInner>`.
+///
+/// Handlers in `SessionOptions` (`can_use_tool`, hooks, …) are owned by the
+/// session; one that needs the session should capture `Session::downgrade()`,
+/// since a captured `Session` keeps it, and the CLI, alive forever.
 #[derive(Clone)]
 pub struct Session(Arc<SessionInner>);
+
+/// A `Session` handle that does not keep the session alive.
+#[derive(Clone)]
+pub struct WeakSession(std::sync::Weak<SessionInner>);
+
+impl WeakSession {
+    /// The session, unless every `Session` handle is gone.
+    pub fn upgrade(&self) -> Option<Session> {
+        self.0.upgrade().map(Session)
+    }
+}
+
+impl fmt::Debug for WeakSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WeakSession(..)")
+    }
+}
 
 struct SessionInner {
     /// Current session id; every `system` frame carries it and `/clear`
@@ -562,21 +621,17 @@ impl Session {
         else {
             return Err(SessionError::Io(std::io::Error::other("subprocess pipes missing")));
         };
-        let on_stderr = opts.on_stderr.clone();
+        let tail = Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        let mut drain = tokio::spawn(drain_stderr(stderr, opts.on_stderr.clone(), tail.clone()));
         let exit = Box::pin(async move {
-            let mut tail = VecDeque::with_capacity(STDERR_TAIL_LINES);
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(cb) = &on_stderr {
-                    (cb.0)(&line);
-                }
-                if tail.len() == STDERR_TAIL_LINES {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
-            }
+            // Exit is the child's, not stderr's EOF: a tool the CLI started
+            // can inherit stderr and hold it open after the CLI is gone.
             let code = child.wait().await.ok().and_then(|s| s.code());
-            ExitInfo { code, stderr: Vec::from(tail).join("\n") }
+            if tokio::time::timeout(STDERR_LINGER, &mut drain).await.is_err() {
+                drain.abort();
+            }
+            let stderr = Vec::from(std::mem::take(&mut *lock(&tail))).join("\n");
+            ExitInfo { code, stderr }
         });
         let transport = Transport { stdin: Box::new(stdin), stdout: Box::new(stdout), exit, pgid };
         Self::connect(transport, opts, init, record).await
@@ -731,7 +786,7 @@ impl Session {
 
     /// Switch model for the following turns. `None` clears the override, so
     /// the CLI falls back to its default model (not to `SessionOptions::model`).
-    /// Source: binary set_model schema
+    /// Source: binary `set_model` schema
     pub async fn set_model(&self, model: Option<&str>) -> Result<()> {
         self.control(&serde_json::json!({ "subtype": "set_model", "model": model })).await.map(|_| ())
     }
@@ -739,7 +794,7 @@ impl Session {
     /// Switch model and replace the custom system prompt. The new prompt is
     /// sent from the next compaction on (from the next turn with
     /// `Initialize::system_prompt_snapshot: Some(false)`).
-    /// Source: binary set_model schema (`system_prompt`)
+    /// Source: binary `set_model` schema (`system_prompt`)
     pub async fn set_model_and_system_prompt(&self, model: &str, system_prompt: &str) -> Result<()> {
         self.control(&serde_json::json!({
             "subtype": "set_model", "model": model, "system_prompt": system_prompt,
@@ -754,7 +809,7 @@ impl Session {
     /// account's default model (no `SessionOptions::model`, no `set_model`);
     /// otherwise use `set_model_and_system_prompt`. The new prompt is sent
     /// from the next compaction on.
-    /// Source: binary set_model schema (`only_if_model_is_current`)
+    /// Source: binary `set_model` schema (`only_if_model_is_current`)
     pub async fn set_system_prompt(&self, model: &str, system_prompt: &str) -> Result<()> {
         self.control(&serde_json::json!({
             "subtype": "set_model", "model": model, "system_prompt": system_prompt,
@@ -766,7 +821,7 @@ impl Session {
 
     /// Thinking-token budget for the following turns (older models);
     /// `None` restores the session's setting.
-    /// Source: binary set_max_thinking_tokens schema
+    /// Source: binary `set_max_thinking_tokens` schema
     pub async fn set_max_thinking_tokens(&self, tokens: Option<u32>, display: Option<ThinkingDisplay>) -> Result<()> {
         let mut body = serde_json::json!({ "subtype": "set_max_thinking_tokens", "max_thinking_tokens": tokens });
         if let Some(d) = display {
@@ -778,7 +833,7 @@ impl Session {
     /// Switch effort level for the following turns; `None` clears the
     /// override, so the CLI falls back to its default level (not to
     /// `SessionOptions::effort`).
-    /// Source: binary apply_flag_settings handler (`effortLevel`)
+    /// Source: binary `apply_flag_settings` handler (`effortLevel`)
     pub async fn set_effort(&self, effort: Option<Effort>) -> Result<()> {
         let settings = serde_json::json!({ "effortLevel": effort });
         self.control(&serde_json::json!({ "subtype": "apply_flag_settings", "settings": settings }))
@@ -786,13 +841,13 @@ impl Session {
             .map(|_| ())
     }
 
-    /// Source: binary set_permission_mode schema
+    /// Source: binary `set_permission_mode` schema
     pub async fn set_permission_mode(&self, mode: PermissionMode) -> Result<()> {
         self.control(&serde_json::json!({ "subtype": "set_permission_mode", "mode": mode })).await.map(|_| ())
     }
 
     /// Stop a background task by its `task_id` (see `AgentEvent::BackgroundTasks`).
-    /// Source: binary stop_task schema
+    /// Source: binary `stop_task` schema
     pub async fn stop_task(&self, task_id: &str) -> Result<()> {
         self.control(&serde_json::json!({ "subtype": "stop_task", "task_id": task_id })).await.map(|_| ())
     }
@@ -800,7 +855,7 @@ impl Session {
     /// Context-window usage of the session, as reported by the CLI.
     /// `exact: true` counts each category with the token-count API; `false`
     /// estimates from the last response's usage, without those calls.
-    /// Source: binary get_context_usage schema
+    /// Source: binary `get_context_usage` schema
     pub async fn context_usage(&self, exact: bool) -> Result<serde_json::Value> {
         let detail = if exact { "full" } else { "summary" };
         self.control(&serde_json::json!({ "subtype": "get_context_usage", "detail": detail })).await
@@ -808,13 +863,13 @@ impl Session {
 
     /// Withdraw a prompt: drop it from the queue if it has not started,
     /// else interrupt its turn. Another prompt's turn is never interrupted.
-    /// Source: binary cancel_async_message and interrupt
+    /// Source: binary `cancel_async_message` and interrupt
     /// (`for_user_message_uuids`) schemas
     pub async fn cancel_prompt(&self, uuid: &str) -> Result<()> {
         let dropped = self
             .control(&serde_json::json!({ "subtype": "cancel_async_message", "message_uuid": uuid }))
             .await?;
-        if dropped.get("cancelled").and_then(|v| v.as_bool()) == Some(true) {
+        if dropped.get("cancelled").and_then(serde_json::Value::as_bool) == Some(true) {
             // No `result` will come for it.
             decrement(&self.0.turns_in_flight);
             return Ok(());
@@ -824,14 +879,14 @@ impl Session {
             .map(|_| ())
     }
 
-    /// Set the session's display title. Source: binary rename_session schema
+    /// Set the session's display title. Source: binary `rename_session` schema
     pub async fn rename_session(&self, title: &str) -> Result<()> {
         self.control(&serde_json::json!({ "subtype": "rename_session", "title": title })).await.map(|_| ())
     }
 
     /// Restore files Claude changed to their state at `user_message_id`
     /// (the `uuid` of a prompt). `dry_run` reports without changing files.
-    /// Source: binary rewind_files schema
+    /// Source: binary `rewind_files` schema
     pub async fn rewind_files(&self, user_message_id: &str, dry_run: bool) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({
             "subtype": "rewind_files", "user_message_id": user_message_id, "dry_run": dry_run,
@@ -839,19 +894,19 @@ impl Session {
         .await
     }
 
-    /// Connection status of every MCP server. Source: binary mcp_status schema
+    /// Connection status of every MCP server. Source: binary `mcp_status` schema
     pub async fn mcp_status(&self) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "mcp_status" })).await
     }
 
-    /// Enable or disable an MCP server. Source: binary mcp_toggle schema
+    /// Enable or disable an MCP server. Source: binary `mcp_toggle` schema
     pub async fn mcp_toggle(&self, server: &str, enabled: bool) -> Result<()> {
         self.control(&serde_json::json!({ "subtype": "mcp_toggle", "serverName": server, "enabled": enabled }))
             .await
             .map(|_| ())
     }
 
-    /// Reconnect a failed or disconnected MCP server. Source: binary mcp_reconnect schema
+    /// Reconnect a failed or disconnected MCP server. Source: binary `mcp_reconnect` schema
     pub async fn mcp_reconnect(&self, server: &str) -> Result<()> {
         self.control(&serde_json::json!({ "subtype": "mcp_reconnect", "serverName": server })).await.map(|_| ())
     }
@@ -860,7 +915,7 @@ impl Session {
     /// plus `external` configs (stdio/http/sse, keyed by name). Servers from
     /// `SessionOptions` and settings stay. Their tools are not pre-allowed:
     /// they go through the permission mode and `can_use_tool`.
-    /// Source: binary mcp_set_servers schema
+    /// Source: binary `mcp_set_servers` schema
     pub async fn set_mcp_servers(
         &self,
         sdk: Vec<SdkMcpServer>,
@@ -871,20 +926,20 @@ impl Session {
         self.control(&serde_json::json!({ "subtype": "mcp_set_servers", "servers": servers })).await
     }
 
-    /// Models the session can switch to. Source: binary list_models schema
+    /// Models the session can switch to. Source: binary `list_models` schema
     pub async fn list_models(&self) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "list_models" })).await
     }
 
     /// Effective merged settings plus each source's raw settings.
-    /// Source: binary get_settings schema
+    /// Source: binary `get_settings` schema
     pub async fn get_settings(&self) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "get_settings" })).await
     }
 
     /// Write settings through the CLI's own writer. `local` = the project's
     /// local settings (allowlist: `outputStyle`); otherwise the user's
-    /// settings (`effortLevel` only). Source: binary update_settings schema
+    /// settings (`effortLevel` only). Source: binary `update_settings` schema
     pub async fn update_settings(&self, local: bool, settings: serde_json::Value) -> Result<serde_json::Value> {
         let source = if local { "localSettings" } else { "userSettings" };
         self.control(&serde_json::json!({ "subtype": "update_settings", "source": source, "settings": settings }))
@@ -894,17 +949,17 @@ impl Session {
     /// Session cost and usage, plus plan rate-limit use when available.
     /// `skip_behaviors` skips the scan of local transcripts (its section is
     /// then null) — enough for a rate-limit meter. Experimental in the CLI.
-    /// Source: binary get_usage schema
+    /// Source: binary `get_usage` schema
     pub async fn get_usage(&self, skip_behaviors: bool) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "get_usage", "skip_behaviors": skip_behaviors })).await
     }
 
-    /// Re-read skills from disk. Source: binary reload_skills schema
+    /// Re-read skills from disk. Source: binary `reload_skills` schema
     pub async fn reload_skills(&self) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "reload_skills" })).await
     }
 
-    /// Re-read plugins from disk. Source: binary reload_plugins schema
+    /// Re-read plugins from disk. Source: binary `reload_plugins` schema
     pub async fn reload_plugins(&self, opts: ReloadPlugins) -> Result<serde_json::Value> {
         let mut body = serde_json::json!({
             "subtype": "reload_plugins",
@@ -918,14 +973,14 @@ impl Session {
     }
 
     /// The last output (≤ 8 KiB) of a background shell or Monitor task.
-    /// Source: binary get_task_output schema
+    /// Source: binary `get_task_output` schema
     pub async fn task_output(&self, task_id: &str) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "get_task_output", "task_id": task_id })).await
     }
 
     /// Add a working-directory root (a subdirectory of `cwd` or of an
     /// `add_dirs` entry) and reload CLAUDE.md, skills and plugins for it.
-    /// Source: binary register_repo_root schema
+    /// Source: binary `register_repo_root` schema
     pub async fn register_repo_root(&self, directory: &str) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({
             "subtype": "register_repo_root", "directory": directory,
@@ -937,7 +992,7 @@ impl Session {
     /// Call a tool of an external MCP server directly, without a model turn
     /// and without a permission check. `tool` is fully qualified
     /// (`mcp__server__tool`). In-process servers are refused: call their
-    /// Rust functions directly. Source: binary mcp_call schema
+    /// Rust functions directly. Source: binary `mcp_call` schema
     pub async fn mcp_call(&self, tool: &str, arguments: serde_json::Value, opts: McpCall) -> Result<serde_json::Value> {
         let mut body = serde_json::json!({ "subtype": "mcp_call", "tool": tool, "arguments": arguments });
         if let Some(t) = opts.timeout {
@@ -953,7 +1008,7 @@ impl Session {
     }
 
     /// Read a `ui://` resource from a connected external MCP server.
-    /// Source: binary mcp_read_resource schema
+    /// Source: binary `mcp_read_resource` schema
     pub async fn mcp_read_resource(&self, server: &str, uri: &str) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "mcp_read_resource", "serverName": server, "uri": uri }))
             .await
@@ -961,7 +1016,7 @@ impl Session {
 
     /// Read a file through the CLI, under the session's read permissions
     /// (`path` relative to `cwd`). `base64` for binary files such as images;
-    /// otherwise lossy UTF-8. Source: binary read_file schema
+    /// otherwise lossy UTF-8. Source: binary `read_file` schema
     pub async fn read_file(&self, path: &str, max_bytes: Option<u64>, base64: bool) -> Result<serde_json::Value> {
         let mut body = serde_json::json!({
             "subtype": "read_file", "path": path,
@@ -974,43 +1029,50 @@ impl Session {
     }
 
     /// @-mention file suggestions for a partial path, as the terminal shows.
-    /// Source: binary file_suggestions schema
+    /// Source: binary `file_suggestions` schema
     pub async fn file_suggestions(&self, query: &str) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "file_suggestions", "query": query })).await
     }
 
     /// Every hook (settings, session, plugin) grouped by event and matcher.
-    /// Source: binary get_hooks_listing schema
+    /// Source: binary `get_hooks_listing` schema
     pub async fn hooks_listing(&self) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "get_hooks_listing" })).await
     }
 
     /// The live permission rules and workspace directories.
-    /// Source: binary list_permission_rules schema
+    /// Source: binary `list_permission_rules` schema
     pub async fn permission_rules(&self) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "list_permission_rules" })).await
     }
 
     /// The formatted session cost summary (`/usage` text).
-    /// Source: binary get_session_cost schema
+    /// Source: binary `get_session_cost` schema
     pub async fn session_cost(&self) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "get_session_cost" })).await
     }
 
-    /// Re-read output styles from disk. Source: binary reload_output_styles schema
+    /// Re-read output styles from disk. Source: binary `reload_output_styles` schema
     pub async fn reload_output_styles(&self) -> Result<serde_json::Value> {
         self.control(&serde_json::json!({ "subtype": "reload_output_styles" })).await
     }
 
     /// Tell the CLI the file at `path` was read at `mtime_ms`, so Edit works
-    /// on it after the Read left the context. Source: binary seed_read_state schema
+    /// on it after the Read left the context. Source: binary `seed_read_state` schema
     pub async fn seed_read_state(&self, path: &str, mtime_ms: u64) -> Result<()> {
         self.control(&serde_json::json!({ "subtype": "seed_read_state", "path": path, "mtime": mtime_ms }))
             .await
             .map(|_| ())
     }
 
+    /// A handle that does not keep the session alive; see `WeakSession`.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakSession {
+        WeakSession(Arc::downgrade(&self.0))
+    }
+
     /// Process id of the CLI (`None` for a replay).
+    #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.0.pgid.and_then(|p| u32::try_from(p).ok())
     }
@@ -1021,7 +1083,9 @@ impl Session {
     }
 
     /// Receive every frame the CLI emits from now on. Lossless: a slow
-    /// receiver buffers instead of dropping frames.
+    /// receiver buffers instead of dropping frames, so memory grows until
+    /// it catches up. Poll the receiver, or drop it once done.
+    #[must_use = "frames buffer until the receiver is dropped"]
     pub fn subscribe(&self) -> EventRx {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut fanout = lock(&self.0.fanout);
@@ -1038,15 +1102,20 @@ impl Session {
     }
 
     /// Payload of the initialize `control_response` (commands, models, account, …).
+    #[must_use]
     pub fn initialize_response(&self) -> Option<&serde_json::Value> {
         self.0.initialize_response.get()
     }
 
+    /// Whether the session streams partial messages
+    /// (`SessionOptions::include_partial`).
+    #[must_use]
     pub fn include_partial(&self) -> bool {
         self.0.include_partial
     }
 
     /// Whether a prompt sent with `Agent` is still waiting for its `result`.
+    #[must_use]
     pub fn is_busy(&self) -> bool {
         self.0.turns_in_flight.load(Ordering::Acquire) > 0
     }
@@ -1063,6 +1132,7 @@ impl Session {
     }
 
     /// Whether the subprocess is still running.
+    #[must_use]
     pub fn is_alive(&self) -> bool {
         self.0.state.load(Ordering::Acquire) == STATE_RUNNING
     }
@@ -1131,26 +1201,21 @@ impl Session {
         // Register before writing so a fast response cannot arrive unmatched.
         let (tx, rx) = oneshot::channel();
         self.0.pending.insert(request_id.clone(), tx);
+        // Unregisters on every exit, including the caller dropping this future.
+        let _registered = PendingGuard { pending: &self.0.pending, request_id: &request_id };
         // The reader marks `ended` before it drops all waiters; a request
         // registered after that would never be answered.
         if lock(&self.0.fanout).ended {
-            self.0.pending.remove(&request_id);
             return Err(self.dead_error().await);
         }
         let envelope = OutboundControlRequest { kind: "control_request", request_id: &request_id, request: body };
-        if let Err(e) = self.send(&envelope).await {
-            self.0.pending.remove(&request_id);
-            return Err(e);
-        }
+        self.send(&envelope).await?;
 
         let reply = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(reply)) => reply,
             // Sender dropped: the reader hit EOF because the process exited.
             Ok(Err(_)) => return Err(self.dead_error().await),
-            Err(_) => {
-                self.0.pending.remove(&request_id);
-                return Err(SessionError::ControlTimeout(subtype));
-            }
+            Err(_) => return Err(SessionError::ControlTimeout(subtype)),
         };
         match reply.subtype.as_str() {
             "success" => Ok(reply.response.unwrap_or(serde_json::Value::Null)),
@@ -1174,18 +1239,67 @@ impl Session {
     }
 }
 
+/// Removes a control request's `pending` entry when dropped.
+struct PendingGuard<'a> {
+    pending: &'a Pending,
+    request_id: &'a str,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.pending.remove(self.request_id);
+    }
+}
+
 impl Drop for SessionInner {
-    /// Dropping the last handle ends the CLI and the tools it started.
+    /// Dropping the last handle ends the CLI and the tools it started:
+    /// SIGTERM now, SIGKILL if the CLI is still running after `CLOSE_GRACE`.
+    /// Without a Tokio runtime there is no escalation; `close().await` is
+    /// the complete shutdown.
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid
-            && self.state.load(Ordering::Acquire) != STATE_DEAD {
-                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::Signal::SIGTERM);
+            && self.state.load(Ordering::Acquire) != STATE_DEAD
+        {
+            use nix::sys::signal::{killpg, Signal};
+            let group = nix::unistd::Pid::from_raw(pgid);
+            let _ = killpg(group, Signal::SIGTERM);
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let mut exit = self.exit.clone();
+                runtime.spawn(async move {
+                    let exited = tokio::time::timeout(CLOSE_GRACE, exit.wait_for(Option::is_some)).await;
+                    if !matches!(exited, Ok(Ok(_))) {
+                        let _ = killpg(group, Signal::SIGKILL);
+                    }
+                });
             }
+        }
         #[cfg(not(unix))]
         if self.state.load(Ordering::Acquire) != STATE_DEAD {
             kill_tree(self.pgid);
         }
+    }
+}
+
+/// Feed every stderr line to `on_stderr` and keep the last ones in `tail`.
+/// A panicking callback is logged, not fatal: the drain must keep running.
+async fn drain_stderr(
+    stderr: tokio::process::ChildStderr,
+    on_stderr: Option<OnStderr>,
+    tail: Arc<std::sync::Mutex<VecDeque<String>>>,
+) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(cb) = &on_stderr
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (cb.0)(&line))).is_err()
+        {
+            tracing::warn!("on_stderr callback panicked");
+        }
+        let mut tail = lock(&tail);
+        if tail.len() == STDERR_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(line);
     }
 }
 
@@ -1248,7 +1362,7 @@ fn cli_args(opts: &SessionOptions) -> Vec<String> {
     for spec in &opts.files {
         flag("--file", Some(spec.clone()));
     }
-    flag("--autocompact", opts.autocompact.map(|a| a.to_arg()));
+    flag("--autocompact", opts.autocompact.map(super::protocol::Autocompact::to_arg));
     flag("--permission-prompts", opts.permission_prompts.map(|p| p.as_str().into()));
     if let Some(Some(name)) = &opts.worktree {
         flag("--worktree", Some(name.clone()));
@@ -1357,24 +1471,36 @@ struct Reader {
 }
 
 async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
-    let Reader { mut record, fanout, session_id, pending, turns_in_flight, responder, done: reader_done } = reader;
+    let Reader { record, fanout, session_id, pending, turns_in_flight, responder, done } = reader;
+    // Runs on EOF and on a panic alike, so streams and waiters never hang.
+    let cleanup = ReaderCleanup {
+        fanout: fanout.clone(),
+        pending,
+        turns_in_flight: turns_in_flight.clone(),
+        responder: responder.clone(),
+        done,
+    };
+    let mut record = record.map(BufWriter::new);
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(file) = record.as_mut()
-            && (file.write_all(line.as_bytes()).await.is_err()
+        if let Some(file) = record.as_mut() {
+            // Flush once a burst is drained, not per line: a slow disk must
+            // not hold up stdout, and the file stays current while idle.
+            let flush = lines.get_ref().buffer().is_empty();
+            if file.write_all(line.as_bytes()).await.is_err()
                 || file.write_all(b"\n").await.is_err()
-                || file.flush().await.is_err())
-        {
-            tracing::warn!("recording failed; continuing without it");
-            record = None;
+                || (flush && file.flush().await.is_err())
+            {
+                tracing::warn!("recording failed; continuing without it");
+                record = None;
+            }
         }
-        let msg = parse_frame(&line);
-        match msg {
+        match parse_frame(&line) {
             InboundMessage::ControlResponse(r) => {
-                if let Some((_, tx)) = pending.remove(&r.response.request_id) {
+                if let Some((_, tx)) = cleanup.pending.remove(&r.response.request_id) {
                     let _ = tx.send(r.response);
                 }
             }
@@ -1394,7 +1520,7 @@ async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
                     responder.in_flight.remove(&request_id);
                     let response = match outcome {
                         Ok(response) => response,
-                        // Withdrawn by the CLI: it wants no answer.
+                        // Withdrawn by the CLI, or the CLI is gone: no answer.
                         Err(e) if e.is_cancelled() => return,
                         Err(e) => ControlResponse::error(&request_id, format!("handler failed: {e}")),
                     };
@@ -1423,21 +1549,44 @@ async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
             }
         }
     }
-    // EOF: close every subscriber and drop every waiter, so streams and
-    // control requests report the exit instead of hanging.
+    if let Some(mut file) = record
+        && file.flush().await.is_err()
     {
-        let mut f = lock(&fanout);
-        f.ended = true;
-        f.subs.clear();
+        tracing::warn!("recording failed to flush");
     }
-    pending.clear();
-    turns_in_flight.store(0, Ordering::Release);
-    drop(record);
-    let _ = reader_done.send(true);
+}
+
+/// End-of-stdout teardown of the reader, run from `Drop`.
+struct ReaderCleanup {
+    fanout: Arc<std::sync::Mutex<Fanout>>,
+    pending: Arc<Pending>,
+    turns_in_flight: Arc<AtomicUsize>,
+    responder: Arc<Responder>,
+    done: watch::Sender<bool>,
+}
+
+impl Drop for ReaderCleanup {
+    fn drop(&mut self) {
+        {
+            let mut f = lock(&self.fanout);
+            f.ended = true;
+            f.subs.clear();
+        }
+        self.pending.clear();
+        self.turns_in_flight.store(0, Ordering::Release);
+        // Handlers still waiting (a permission prompt, an elicitation) have
+        // no CLI left to answer.
+        self.responder.in_flight.retain(|_, task| {
+            task.abort();
+            false
+        });
+        let _ = self.done.send(true);
+    }
 }
 
 /// Decode one stdout line. A `result` the typed model cannot decode still
-/// ends its turn, as a minimal result, so no stream waits forever.
+/// ends its turn, as a minimal result, so no stream waits forever; any other
+/// undecodable JSON frame becomes `Other`.
 fn parse_frame(line: &str) -> InboundMessage {
     match serde_json::from_str(line) {
         // A frame type this SDK does not model: keep it verbatim.
@@ -1453,7 +1602,7 @@ fn parse_frame(line: &str) -> InboundMessage {
                 tracing::warn!(error = %e, "undecodable result frame; ending the turn with it");
                 InboundMessage::Result(ResultMessage {
                     subtype: field("subtype").unwrap_or_else(|| "error_unparsed_result".into()),
-                    is_error: value.as_ref().and_then(|v| v.get("is_error")).and_then(|v| v.as_bool()).unwrap_or(false),
+                    is_error: value.as_ref().and_then(|v| v.get("is_error")).and_then(serde_json::Value::as_bool).unwrap_or(false),
                     result: field("result"),
                     session_id: field("session_id"),
                     origin: value.as_ref().and_then(|v| v.get("origin")).cloned(),
@@ -1466,8 +1615,13 @@ fn parse_frame(line: &str) -> InboundMessage {
                     request_id: request_id.to_owned(),
                     request: ControlRequestBody::Unsupported,
                 })
+            } else if let Some(value) = value {
+                // A known type in a shape this SDK cannot decode: hand it on
+                // verbatim rather than losing it.
+                tracing::warn!(error = %e, "undecodable frame; passing it on as Other");
+                InboundMessage::Other(value)
             } else {
-                tracing::debug!(error = %e, line = %line, "unparsed stdout line");
+                tracing::debug!(error = %e, line = %line, "non-JSON stdout line");
                 InboundMessage::Unknown
             }
         }
@@ -1509,7 +1663,7 @@ impl Responder {
                             updated_input: Some(updated_input.unwrap_or(original)),
                             updated_permissions,
                         },
-                        deny => deny,
+                        deny @ ToolDecision::Deny { .. } => deny,
                     };
                     match serde_json::to_value(decision) {
                         Ok(v) => ControlResponse::success(&req.request_id, v),
@@ -1561,12 +1715,9 @@ impl Responder {
 
     async fn write(&self, response: &ControlResponse) {
         match serde_json::to_vec(response) {
-            Ok(bytes) => match self.stdin_tx.upgrade() {
-                Some(tx) => {
-                    let _ = tx.send(bytes).await;
-                }
-                None => tracing::debug!("session closed; dropping control response"),
-            },
+            Ok(bytes) => if let Some(tx) = self.stdin_tx.upgrade() {
+                let _ = tx.send(bytes).await;
+            } else { tracing::debug!("session closed; dropping control response") },
             Err(e) => tracing::warn!(error = %e, "failed to serialize control response"),
         }
     }

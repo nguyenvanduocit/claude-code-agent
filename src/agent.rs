@@ -1,6 +1,6 @@
 //! Agent layer — sends a turn and returns a streaming event iterator.
 //!
-//! Control requests (hook callbacks, can_use_tool) are answered by the
+//! Control requests (hook callbacks, `can_use_tool`) are answered by the
 //! `Session` itself; this layer only turns frames into `AgentEvent`s.
 //! `prompt` yields the events of one turn; `watch` yields every turn's,
 //! including the turns the CLI starts on its own.
@@ -15,7 +15,9 @@ use crate::session::{Session, SessionError};
 
 // ─── Event stream ─────────────────────────────────────────────────────────────
 
+/// One event of a turn, translated from the CLI's stdout frames.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AgentEvent {
     /// A text delta (requires --include-partial-messages OR full assistant message).
     Text(String),
@@ -25,57 +27,112 @@ pub enum AgentEvent {
     RedactedThinking(String),
     /// A tool call: one the CLI runs, or one the API runs itself
     /// (`server: true`, e.g. web search).
-    ToolUse { id: String, name: String, input: serde_json::Value, server: bool },
+    ToolUse {
+        /// Tool call id; matches `ToolResult::tool_use_id`.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// Tool input, as the model wrote it.
+        input: serde_json::Value,
+        /// `true` for a server tool call (`server_tool_use` block).
+        server: bool,
+    },
     /// The result of a tool call. `content` is a string or content blocks,
     /// as sent to the model; `structured` is the tool's full output when
     /// the CLI reports one (e.g. Bash `{stdout, stderr, interrupted, …}`).
     ToolResult {
+        /// Id of the `ToolUse` this result answers.
         tool_use_id: String,
+        /// Result sent to the model: a string or content blocks.
         content: serde_json::Value,
+        /// The tool call failed.
         is_error: bool,
+        /// The tool's full output (`tool_use_result`), when reported.
         structured: Option<serde_json::Value>,
     },
     /// An event of a subagent, started by the `Agent`/`Task` tool call
     /// `parent_tool_use_id`.
-    Subagent { parent_tool_use_id: String, event: Box<AgentEvent> },
+    Subagent {
+        /// Id of the `Agent`/`Task` tool call that started the subagent.
+        parent_tool_use_id: String,
+        /// The subagent's event.
+        event: Box<AgentEvent>,
+    },
     /// Background task tree updated (replace semantics).
     BackgroundTasks(Vec<BackgroundTask>),
     /// Model was switched during the turn.
-    ModelFallback { from: String, to: String, trigger: String },
+    ModelFallback {
+        /// Model before the switch (`original_model`).
+        from: String,
+        /// Model after the switch (`fallback_model`).
+        to: String,
+        /// The frame's `trigger` field.
+        trigger: String,
+    },
     /// Context was compacted (`trigger`: "manual" for /compact, "auto").
-    Compacted { trigger: String, pre_tokens: Option<u64>, post_tokens: Option<u64> },
+    Compacted {
+        /// "manual" or "auto".
+        trigger: String,
+        /// Context tokens before compaction.
+        pre_tokens: Option<u64>,
+        /// Context tokens after compaction.
+        post_tokens: Option<u64>,
+    },
     /// Any other `system` frame (`init`, `api_retry`, `task_started`,
     /// `hook_response`, `permission_denied`, `status`, …), verbatim.
-    System { subtype: String, data: serde_json::Value },
+    System {
+        /// The frame's `subtype`.
+        subtype: String,
+        /// The whole frame.
+        data: serde_json::Value,
+    },
     /// Any other frame (`rate_limit_event`, `tool_progress`,
     /// `prompt_suggestion`, `command_lifecycle`, …), verbatim.
-    Other { kind: String, data: serde_json::Value },
+    Other {
+        /// The frame's `type`.
+        kind: String,
+        /// The whole frame.
+        data: serde_json::Value,
+    },
     /// Turn completed successfully.
     Done(TurnResult),
     /// Turn failed.
     Error(TurnError),
 }
 
-#[derive(Debug, Clone)]
+/// Outcome of a finished turn, from its `result` frame.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct TurnResult {
+    /// Session id the CLI reported.
     pub session_id: Option<String>,
     /// Final text of the turn.
     pub result: Option<String>,
     /// Output matching `Initialize::json_schema`.
     pub structured_output: Option<serde_json::Value>,
+    /// Cost in USD (`total_cost_usd`).
     pub total_cost_usd: Option<f64>,
+    /// Time to first token, in milliseconds (`ttft_ms`).
     pub ttft_ms: Option<u64>,
+    /// Wall-clock duration of the turn, in milliseconds (`duration_ms`).
     pub duration_ms: Option<u64>,
+    /// Time spent in API calls, in milliseconds (`duration_api_ms`).
     pub duration_api_ms: Option<u64>,
     /// Agentic turns (model calls) the turn took.
     pub num_turns: Option<u64>,
+    /// `usage.input_tokens`.
     pub input_tokens: Option<u64>,
+    /// `usage.output_tokens`.
     pub output_tokens: Option<u64>,
+    /// `usage.cache_read_input_tokens`.
     pub cache_read_input_tokens: Option<u64>,
+    /// `usage.cache_creation_input_tokens`.
     pub cache_creation_input_tokens: Option<u64>,
     /// Per-model token and cost breakdown.
     pub model_usage: Option<serde_json::Value>,
+    /// `stop_reason` of the `result` frame.
     pub stop_reason: Option<String>,
+    /// Why the agent loop ended (`terminal_reason`, e.g. "completed").
     pub terminal_reason: Option<String>,
     /// Tool calls the permission system denied.
     pub permission_denials: Vec<serde_json::Value>,
@@ -110,11 +167,16 @@ impl From<&ResultMessage> for TurnResult {
 }
 
 /// Why a turn failed. `result` carries cost and usage up to the failure.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("{message}")]
+#[non_exhaustive]
 pub struct TurnError {
+    /// Failure category.
     pub kind: TurnErrorKind,
+    /// Human-readable error message.
     pub message: String,
+    /// Usage up to the failure; `None` when the turn never ran or the
+    /// session closed.
     pub result: Option<TurnResult>,
 }
 
@@ -138,12 +200,13 @@ impl TurnError {
     }
 }
 
+/// Error starting a turn.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AgentError {
+    /// The session failed to send the prompt.
     #[error("session error: {0}")]
     Session(#[from] SessionError),
-    #[error("json: {0}")]
-    Json(#[from] serde_json::Error),
 }
 
 /// Events of one turn; ends after `Done` or `Error`. Dropping it before
@@ -158,15 +221,19 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Wrap `session`.
+    #[must_use]
     pub fn new(session: Session) -> Self {
         Self { session }
     }
 
+    /// The underlying session.
+    #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
     }
 
-    /// Run a text prompt and return a streaming iterator of AgentEvents.
+    /// Run a text prompt and return a streaming iterator of `AgentEvents`.
     ///
     /// The stream ends after a `Done` or `Error` event.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<AgentStream, AgentError> {
@@ -286,7 +353,8 @@ impl Agent {
     /// Every event of every turn from now on — prompted turns and the turns
     /// the CLI starts itself (`TurnResult::origin` set), each ending with
     /// `Done` or `Error`. Ends when the session closes. Dropping it cancels
-    /// nothing.
+    /// nothing. Lossless like `Session::subscribe`: events buffer until
+    /// polled, so poll it or drop it.
     pub fn watch(&self) -> AgentStream {
         let mut rx = self.session.subscribe();
         let partial = self.session.include_partial();
@@ -332,7 +400,7 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// The AgentEvents one frame produces. `partial`: text arrives as stream
+/// The `AgentEvents` one frame produces. `partial`: text arrives as stream
 /// deltas, so complete main-thread text is skipped. Frames of subagents
 /// (`parent_tool_use_id` set) are wrapped in `AgentEvent::Subagent`; their
 /// text comes from complete messages only.
@@ -402,7 +470,7 @@ fn to_events(msg: &InboundMessage, partial: bool) -> Vec<AgentEvent> {
             }
             "compact_boundary" => {
                 let meta = s.extra.get("compact_metadata");
-                let num = |k: &str| meta.and_then(|m| m.get(k)).and_then(|v| v.as_u64());
+                let num = |k: &str| meta.and_then(|m| m.get(k)).and_then(serde_json::Value::as_u64);
                 vec![AgentEvent::Compacted {
                     trigger: meta.and_then(|m| m.get("trigger")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     pre_tokens: num("pre_tokens"),
@@ -411,7 +479,10 @@ fn to_events(msg: &InboundMessage, partial: bool) -> Vec<AgentEvent> {
             }
             other => vec![AgentEvent::System {
                 subtype: other.to_string(),
-                data: serde_json::to_value(s).unwrap_or_default(),
+                data: serde_json::to_value(s).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "could not serialize a system frame");
+                    serde_json::Value::Null
+                }),
             }],
         },
 

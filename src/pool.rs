@@ -23,8 +23,10 @@ use crate::agent::{Agent, AgentEvent};
 use crate::protocol::{Effort, Initialize, PermissionMode};
 use crate::session::{Result, Session, SessionError, SessionOptions};
 
+/// Configuration of a `SessionPool`.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
+    /// Most sessions checked out at once. Default 4.
     pub max_sessions: usize,
     /// Options every pooled session is spawned with (`cwd`, hooks, …).
     pub options: SessionOptions,
@@ -40,8 +42,11 @@ impl Default for PoolConfig {
 /// `PoolConfig::options`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Checkout {
+    /// Model (`Session::set_model`).
     pub model: Option<String>,
+    /// Effort level (`Session::set_effort`).
     pub effort: Option<Effort>,
+    /// Permission mode (`Session::set_permission_mode`).
     pub permission_mode: Option<PermissionMode>,
 }
 
@@ -74,6 +79,8 @@ struct PoolInner {
 pub struct SessionPool(Arc<PoolInner>);
 
 impl SessionPool {
+    /// An empty pool; sessions spawn on `warm` or `acquire`.
+    #[must_use]
     pub fn new(config: PoolConfig) -> Self {
         let max = config.max_sessions;
         SessionPool(Arc::new(PoolInner {
@@ -89,7 +96,8 @@ impl SessionPool {
         let room = self.0.semaphore.available_permits().saturating_sub(self.idle().len());
         let count = n.min(room);
         // Held while spawning, so a concurrent acquire() cannot spawn past the limit.
-        let Ok(_permits) = Arc::clone(&self.0.semaphore).try_acquire_many_owned(count as u32) else {
+        let Ok(permits) = u32::try_from(count) else { return 0 };
+        let Ok(_permits) = Arc::clone(&self.0.semaphore).try_acquire_many_owned(permits) else {
             return 0;
         };
         let tasks: Vec<_> = (0..count)
@@ -191,6 +199,7 @@ async fn apply(session: &Session, options: &SessionOptions) -> std::result::Resu
 /// clones of `session` (e.g. inside an `Agent`) no longer than the
 /// `PooledSession`: after Drop another task may get the same session.
 pub struct PooledSession {
+    /// The borrowed session.
     pub session: Session,
     pool: SessionPool,
     _permit: tokio::sync::OwnedSemaphorePermit,

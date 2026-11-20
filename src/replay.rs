@@ -6,8 +6,8 @@
 //! in-memory fake CLI that answers `initialize` with the recorded response and
 //! plays back one recorded turn per user message.
 //!
-//! Control requests the CLI made during recording (hooks, can_use_tool,
-//! mcp_message) are not replayed: their answers came from host code, which a
+//! Control requests the CLI made during recording (hooks, `can_use_tool`,
+//! `mcp_message`) are not replayed: their answers came from host code, which a
 //! replay does not re-run.
 use std::path::Path;
 
@@ -33,8 +33,9 @@ impl Recording {
         let mut initialize_response = None;
         let mut turns = vec![];
         let mut current = vec![];
-        for line in jsonl.lines().filter(|l| !l.trim().is_empty()) {
-            let frame: Value = serde_json::from_str(line)?;
+        for (n, line) in jsonl.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let frame: Value = serde_json::from_str(line)
+                .map_err(|e| SessionError::InvalidRecording(format!("line {}: {e}", n + 1)))?;
             match frame.get("type").and_then(Value::as_str) {
                 Some("control_response") => {
                     if initialize_response.is_none() {
@@ -52,12 +53,12 @@ impl Recording {
                 _ => current.push(line.to_string()),
             }
         }
-        let initialize_response = initialize_response.ok_or_else(|| {
-            SessionError::Io(std::io::Error::other("recording has no initialize response"))
-        })?;
+        let initialize_response = initialize_response
+            .ok_or_else(|| SessionError::InvalidRecording("no initialize response".into()))?;
         Ok(Self { initialize_response, turns })
     }
 
+    /// Read and parse a JSONL recording file.
     pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
         Self::parse(&tokio::fs::read_to_string(path).await?)
     }
@@ -72,7 +73,7 @@ pub async fn replay(path: impl AsRef<Path>, opts: SessionOptions) -> Result<Sess
     let (host_out, host_in) = tokio::io::split(host);
     let fake = tokio::spawn(fake_cli(cli, recording));
     let exit = Box::pin(async move {
-        let code = fake.await.ok().map(|_| 0);
+        let code = fake.await.ok().map(|()| 0);
         ExitInfo { code, stderr: String::new() }
     });
     let transport = Transport { stdin: Box::new(host_in), stdout: Box::new(host_out), exit, pgid: None };
@@ -95,7 +96,7 @@ async fn fake_cli(io: tokio::io::DuplexStream, recording: Recording) {
                 })
                 .to_string()]
             }
-            Some("user") => turns.next().map(|frames| with_echo_uuid(frames, &msg["uuid"])).unwrap_or_else(|| {
+            Some("user") => turns.next().map_or_else(|| {
                 vec![
                     json!({ "type": "user", "isReplay": true, "uuid": msg["uuid"], "message": msg["message"] })
                         .to_string(),
@@ -107,7 +108,7 @@ async fn fake_cli(io: tokio::io::DuplexStream, recording: Recording) {
                     })
                     .to_string(),
                 ]
-            }),
+            }, |frames| with_echo_uuid(frames, &msg["uuid"])),
             _ => vec![],
         };
         for frame in out {
