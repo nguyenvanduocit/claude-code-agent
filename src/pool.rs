@@ -1,15 +1,15 @@
-/// Session pool — pre-warmed persistent processes with idle reuse.
-///
-///   - at most `max_sessions` sessions are checked out at once (semaphore)
-///   - every session uses `PoolConfig::options` (hooks, MCP servers, model, …)
-///   - a returned session is reset with `/clear` before it is handed out
-///     again, so one task never sees another task's conversation
-///   - dead sessions are dropped and replaced by a fresh spawn
-///   - a session returned while its turn is still running is not reused;
-///     it ends once its last handle is dropped (until then it runs outside
-///     the `max_sessions` count)
-///   - model and permission mode changed with `set_model` /
-///     `set_permission_mode` stay with the session across reuse
+//! Session pool — pre-warmed persistent processes with idle reuse.
+//!
+//!   - at most `max_sessions` sessions are checked out at once (semaphore)
+//!   - every session uses `PoolConfig::options` (hooks, MCP servers, model, …)
+//!   - a returned session is reset with `/clear` before it is handed out
+//!     again, so one task never sees another task's conversation
+//!   - dead sessions are dropped and replaced by a fresh spawn
+//!   - a session returned while its turn is still running is not reused;
+//!     it ends once its last handle is dropped (until then it runs outside
+//!     the `max_sessions` count)
+//!   - model and permission mode changed with `set_model` /
+//!     `set_permission_mode` stay with the session across reuse
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::Semaphore;

@@ -1,9 +1,9 @@
-/// Background task tree tracking.
-///
-/// background_tasks_changed is a level signal (replace semantics).
-/// Feed it `AgentEvent::BackgroundTasks`; background a running task with
-/// `session.control(&BackgroundTasksRequest::one(tool_use_id))`.
-/// Source: binary background_tasks_changed + background_tasks schemas
+//! Background task tree tracking.
+//!
+//! background_tasks_changed is a level signal (replace semantics).
+//! Feed it `AgentEvent::BackgroundTasks`; background a running task with
+//! `session.control(&BackgroundTasksRequest::one(tool_use_id))`.
+//! Source: binary background_tasks_changed + background_tasks schemas
 use crate::protocol::BackgroundTask;
 
 /// Tracks the current agent task tree from background_tasks_changed events.

@@ -1,35 +1,38 @@
-/// #[claude_tool] — turn a (async) fn into a Claude tool at compile time.
-///
-/// Usage:
-/// ```rust,ignore
-/// /// Search the filesystem for files matching a pattern
-/// #[claude_tool]
-/// async fn search_files(pattern: String, max_results: u64) -> anyhow::Result<Vec<String>> {
-///     // implementation
-/// }
-/// ```
-///
-/// Generates, next to the fn:
-/// ```rust,ignore
-/// pub fn search_files_tool_def() -> claude_sdk::protocol::ToolDef { ... }
-/// pub fn search_files_tool() -> claude_sdk::SdkTool { ... } // def + handler
-/// ```
-/// Register the tool with `SdkMcpServer::new("name").tool(search_files_tool())`.
-///
-/// Arguments are deserialized with serde (`T: DeserializeOwned`; `&str` / `&T`
-/// are deserialized owned and borrowed). The return value becomes the tool
-/// result: `Result<T, E>` → `T` or an error result with `E: Display`;
-/// `ToolResult` → passed through; `()` → "ok"; anything else → serde JSON
-/// (strings verbatim).
-///
-/// Type mapping for the input schema:
-///   String / &str    → {"type":"string"}
-///   i8..i128/u8..u128/f32/f64/usize/isize → {"type":"number"}
-///   bool             → {"type":"boolean"}
-///   Vec<String>      → {"type":"array","items":{"type":"string"}}
-///   Vec<_>           → {"type":"array"}
-///   Option<T>        → same as T but NOT added to `required`
-///   anything else    → {"type":"object"}
+//! #[claude_tool] — turn a (async) fn into a Claude tool at compile time.
+//!
+//! Usage:
+//! ```rust,ignore
+//! /// Search the filesystem for files matching a pattern
+//! #[claude_tool]
+//! async fn search_files(pattern: String, max_results: u64) -> anyhow::Result<Vec<String>> {
+//!     // implementation
+//! }
+//! ```
+//!
+//! Generates, next to the fn:
+//! ```rust,ignore
+//! pub fn search_files_tool_def() -> claude_sdk::protocol::ToolDef { ... }
+//! pub fn search_files_tool() -> claude_sdk::SdkTool { ... } // def + handler
+//! ```
+//! Register the tool with `SdkMcpServer::new("name").tool(search_files_tool())`.
+//!
+//! Arguments are deserialized with serde (`T: DeserializeOwned`; `&str` / `&T`
+//! are deserialized owned and borrowed). The return value becomes the tool
+//! result: `Result<T, E>` → `T` or an error result with `E: Display`;
+//! `ToolResult` → passed through; `()` → "ok"; anything else → serde JSON
+//! (strings verbatim).
+//!
+//! Type mapping for the input schema:
+//! ```text
+//! String / &str                  → {"type":"string"}
+//! i8..i128/u8..u128/usize/isize  → {"type":"integer"}
+//! f32/f64                        → {"type":"number"}
+//! bool                           → {"type":"boolean"}
+//! Vec<String>                    → {"type":"array","items":{"type":"string"}}
+//! Vec<_>                         → {"type":"array"}
+//! Option<T>                      → same as T but NOT added to `required`
+//! anything else                  → {"type":"object"}
+//! ```
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote, quote_spanned};
@@ -205,14 +208,12 @@ fn owned_type(ty: &Type) -> (TokenStream2, bool) {
 fn extract_doc(attrs: &[Attribute]) -> String {
     let mut lines = vec![];
     for attr in attrs {
-        if attr.path().is_ident("doc") {
-            if let Meta::NameValue(nv) = &attr.meta {
-                if let syn::Expr::Lit(el) = &nv.value {
-                    if let Lit::Str(s) = &el.lit {
-                        lines.push(s.value().trim().to_string());
-                    }
-                }
-            }
+        if attr.path().is_ident("doc")
+            && let Meta::NameValue(nv) = &attr.meta
+            && let syn::Expr::Lit(el) = &nv.value
+            && let Lit::Str(s) = &el.lit
+        {
+            lines.push(s.value().trim().to_string());
         }
     }
     lines.join(" ")
@@ -229,27 +230,23 @@ fn type_to_schema(ty: &Type) -> (bool, TokenStream2) {
 
             // Option<T> → unwrap inner, mark optional
             if name == "Option" {
-                if let PathArguments::AngleBracketed(ab) = &last.arguments {
-                    if let Some(GenericArgument::Type(inner)) = ab.args.first() {
-                        let (_, inner_schema) = type_to_schema(inner);
-                        return (true, inner_schema);
-                    }
+                if let PathArguments::AngleBracketed(ab) = &last.arguments
+                    && let Some(GenericArgument::Type(inner)) = ab.args.first()
+                {
+                    let (_, inner_schema) = type_to_schema(inner);
+                    return (true, inner_schema);
                 }
                 return (true, quote! { {"type": "object"} });
             }
 
             // Vec<T>
             if name == "Vec" {
-                if let PathArguments::AngleBracketed(ab) = &last.arguments {
-                    if let Some(GenericArgument::Type(inner)) = ab.args.first() {
-                        if let Type::Path(itp) = inner {
-                            if let Some(iseg) = itp.path.segments.last() {
-                                if iseg.ident == "String" || iseg.ident == "str" {
-                                    return (false, quote! { {"type": "array", "items": {"type": "string"}} });
-                                }
-                            }
-                        }
-                    }
+                if let PathArguments::AngleBracketed(ab) = &last.arguments
+                    && let Some(GenericArgument::Type(Type::Path(itp))) = ab.args.first()
+                    && let Some(iseg) = itp.path.segments.last()
+                    && (iseg.ident == "String" || iseg.ident == "str")
+                {
+                    return (false, quote! { {"type": "array", "items": {"type": "string"}} });
                 }
                 return (false, quote! { {"type": "array"} });
             }
@@ -258,8 +255,8 @@ fn type_to_schema(ty: &Type) -> (bool, TokenStream2) {
                 "String" | "str" => quote! { {"type": "string"} },
                 "bool" => quote! { {"type": "boolean"} },
                 "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
-                | "f32" | "f64" => quote! { {"type": "number"} },
+                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => quote! { {"type": "integer"} },
+                "f32" | "f64" => quote! { {"type": "number"} },
                 _ => quote! { {"type": "object"} },
             };
             (false, schema)

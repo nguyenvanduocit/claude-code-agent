@@ -1,12 +1,12 @@
-/// Hook registry — async Rust closures for all 33 hook event types.
-///
-/// Build it before spawning and pass it in `SessionOptions::hooks`: the CLI
-/// learns which hooks exist only from the `initialize` request, so hooks
-/// registered after spawn would never fire.
-///
-/// Each `on()` call becomes one matcher with one callback id `hook_<n>`; when
-/// the hook fires the CLI sends `hook_callback { callback_id: "hook_<n>" }`.
-/// Source: claude_agent_sdk 0.1.48 _internal/query.py:128–147, :285–300
+//! Hook registry — async Rust closures for all 33 hook event types.
+//!
+//! Build it before spawning and pass it in `SessionOptions::hooks`: the CLI
+//! learns which hooks exist only from the `initialize` request, so hooks
+//! registered after spawn would never fire.
+//!
+//! Each `on()` call becomes one matcher with one callback id `hook_<n>`; when
+//! the hook fires the CLI sends `hook_callback { callback_id: "hook_<n>" }`.
+//! Source: claude_agent_sdk 0.1.48 _internal/query.py:128–147, :285–300
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;

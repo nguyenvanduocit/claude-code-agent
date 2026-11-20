@@ -15,7 +15,7 @@ Rust SDK for [Claude Code](https://claude.ai/claude-code). It drives the `claude
 Pin the git dependency to a commit or tag:
 
 ```toml
-claude-sdk = { git = "https://github.com/nguyenvanduocit/claude-sdk-rs", tag = "v0.2.0", features = ["macros"] }
+claude-sdk = { git = "https://github.com/nguyenvanduocit/claude-sdk-rs", tag = "v0.3.0", features = ["macros"] }
 ```
 
 ## Quick start
@@ -140,7 +140,7 @@ let mut stream = claude_sdk::compaction::compact(&agent, Some("keep file paths a
 let opts = SessionOptions { code_mode: true, ..Default::default() };
 ```
 
-Claude gets the `REPL` tool and works by writing JavaScript that calls its tools. The stock CLI refuses Code Mode for every non-interactive session, so the SDK runs a patched copy. It is built on first use (about 6 s), cached under `~/.cache/claude-sdk/code-mode/`, and re-signed on macOS. The installed `claude` is not modified. The patch changes only the Code Mode opt-in module: the eligibility check passes, the caveats count as accepted, and the server gate counts as open. See DESIGN.md.
+Experimental and unsupported by Anthropic: Code Mode is gated server-side, and this option forces it on. Claude gets the `REPL` tool and works by writing JavaScript that calls its tools. The stock CLI refuses Code Mode for every non-interactive session, so the SDK runs a patched copy. It is built on first use (about 6 s), cached under `~/.cache/claude-sdk/code-mode/`, and re-signed on macOS. The installed `claude` is not modified. The patch changes only the Code Mode opt-in module: the eligibility check passes, the caveats count as accepted, and the server gate counts as open. See DESIGN.md.
 
 ## Session options worth knowing
 
@@ -148,7 +148,7 @@ Claude gets the `REPL` tool and works by writing JavaScript that calls its tools
 |---|---|
 | `permission_mode: Some(PermissionMode::…)` | `--permission-mode` (default, acceptEdits, bypassPermissions, plan, dontAsk, auto) |
 | `setting_sources: Some(vec![])` | ignore user/project settings (`--setting-sources ""`); auth still works |
-| `settings: Some(json)` | extra settings (`--settings`), e.g. shell hooks |
+| `settings: Some(json)` | extra settings (`--settings`): an object, or a file path string; e.g. shell hooks |
 | `clear_env: true` | child gets only `env`, not the parent environment (default inherits, like the official SDKs) |
 | `resume: Some(id)` / `Session::reconnect` | continue a previous conversation (`--resume`) |
 | `include_partial: true` | text arrives as stream deltas |

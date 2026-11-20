@@ -1,28 +1,28 @@
-/// Force Code Mode (the `REPL` tool) on for SDK sessions.
-///
-/// The stock CLI (verified 2.1.329) refuses Code Mode for every
-/// non-interactive session (`-p` / stream-json), so no SDK gets it. With
-/// `SessionOptions::code_mode` the SDK runs a patched copy of the CLI
-/// instead; the installed binary is never modified.
-///
-/// The patch touches only the Code Mode opt-in module of Bun's embedded
-/// module graph:
-///   1. local eligibility check (`entrypoint`, `unattended`, provider, …) passes
-///   2. the one-time caveats dialog counts as accepted
-///   3. the server gate `tengu_rustling_blossom` counts as open
-///   4. the module's precompiled bytecode is dropped, so Bun compiles the
-///      patched source (the bytecode would otherwise run unchanged)
-///
-/// Every edit keeps the byte length, so no offset in the binary moves. An
-/// anchor that is missing or ambiguous (a CLI version this patch does not
-/// know) is an error, never a silent partial patch.
-///
-/// Layout of Bun's standalone module graph (Format B, Claude Code 2.1.280+):
-/// trailer `"\n---- Bun! ----\n"` preceded by a 32-byte offsets struct
-/// (`byte_count: u64, modules: (u32 offset, u32 len), …`); the module list
-/// is 52-byte entries of six `(u32 offset, u32 len)` pointers (name,
-/// contents, sourcemap, bytecode, module_info, bytecode_origin_path) plus
-/// four flag bytes; offsets are relative to `trailer - 32 - byte_count`.
+//! Force Code Mode (the `REPL` tool) on for SDK sessions.
+//!
+//! The stock CLI (verified 2.1.329) refuses Code Mode for every
+//! non-interactive session (`-p` / stream-json), so no SDK gets it. With
+//! `SessionOptions::code_mode` the SDK runs a patched copy of the CLI
+//! instead; the installed binary is never modified.
+//!
+//! The patch touches only the Code Mode opt-in module of Bun's embedded
+//! module graph:
+//!   1. local eligibility check (`entrypoint`, `unattended`, provider, …) passes
+//!   2. the one-time caveats dialog counts as accepted
+//!   3. the server gate `tengu_rustling_blossom` counts as open
+//!   4. the module's precompiled bytecode is dropped, so Bun compiles the
+//!      patched source (the bytecode would otherwise run unchanged)
+//!
+//! Every edit keeps the byte length, so no offset in the binary moves. An
+//! anchor that is missing or ambiguous (a CLI version this patch does not
+//! know) is an error, never a silent partial patch.
+//!
+//! Layout of Bun's standalone module graph (Format B, Claude Code 2.1.280+):
+//! trailer `"\n---- Bun! ----\n"` preceded by a 32-byte offsets struct
+//! (`byte_count: u64, modules: (u32 offset, u32 len), …`); the module list
+//! is 52-byte entries of six `(u32 offset, u32 len)` pointers (name,
+//! contents, sourcemap, bytecode, module_info, bytecode_origin_path) plus
+//! four flag bytes; offsets are relative to `trailer - 32 - byte_count`.
 use std::path::{Path, PathBuf};
 
 use regex::bytes::Regex;
@@ -153,21 +153,15 @@ static BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Path of a patched copy of `binary` (resolved through `PATH`), built on
 /// first use and cached under `<cache>/claude-sdk/code-mode/`. The cache key
-/// is the installed binary's real path, size and mtime, so a CLI update
-/// builds a new copy.
+/// is the installed binary's name, size and mtime plus this SDK's version,
+/// so a CLI update or a new patch builds a new copy.
 pub async fn patched_binary(binary: &Path) -> Result<PathBuf, CodeModeError> {
     if cfg!(windows) {
         return Err(CodeModeError::UnsupportedPlatform);
     }
     let source = tokio::fs::canonicalize(resolve(binary)).await?;
-    let meta = tokio::fs::metadata(&source).await?;
-    let mtime = meta
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
-    let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "claude".into());
-    let target = cache_dir().join(format!("{name}-{}-{mtime}", meta.len())).join("claude");
+    let key = source_key(&source).await?;
+    let target = cache_dir().join(format!("{key}-sdk{}", env!("CARGO_PKG_VERSION"))).join("claude");
 
     let _guard = BUILD.lock().await;
     if tokio::fs::try_exists(&target).await? {
@@ -175,6 +169,9 @@ pub async fn patched_binary(binary: &Path) -> Result<PathBuf, CodeModeError> {
     }
     let dir = target.parent().ok_or(CodeModeError::NotBunBinary("cache path"))?;
     tokio::fs::create_dir_all(dir).await?;
+    // Read by prune_stale_builds in any process: the build is stale once
+    // this source changes or disappears.
+    tokio::fs::write(dir.join(SOURCE_FILE), source.to_string_lossy().as_bytes()).await?;
 
     let original = tokio::fs::read(&source).await?;
     let patched = tokio::task::spawn_blocking(move || patch(&original))
@@ -198,21 +195,54 @@ pub async fn patched_binary(binary: &Path) -> Result<PathBuf, CodeModeError> {
         return Err(e);
     }
     tokio::fs::rename(&partial, &target).await?;
-    prune_other_builds(dir).await;
+    prune_stale_builds(dir).await;
     tracing::info!(source = %source.display(), patched = %target.display(), "built Code Mode CLI");
     Ok(target)
 }
 
-/// Delete copies built for earlier CLI versions (about 230 MB each). A
-/// session still running one keeps working: unix unlinks open files lazily.
-async fn prune_other_builds(current: &Path) {
+/// Name of the file in each build directory holding the source CLI's path.
+const SOURCE_FILE: &str = "source";
+
+/// `<name>-<size>-<mtime>` of the installed CLI.
+async fn source_key(source: &Path) -> std::io::Result<String> {
+    let meta = tokio::fs::metadata(source).await?;
+    let mtime = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "claude".into());
+    Ok(format!("{name}-{}-{mtime}", meta.len()))
+}
+
+/// Delete copies (about 230 MB each) whose source CLI was updated or
+/// removed. Copies of CLIs still installed stay, so programs using other
+/// CLI installs or SDK versions keep theirs. A session still running a
+/// deleted copy keeps working: unix unlinks open files lazily.
+async fn prune_stale_builds(current: &Path) {
     let Some(root) = current.parent() else { return };
     let Ok(mut entries) = tokio::fs::read_dir(root).await else { return };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path != current && path.is_dir() && tokio::fs::remove_dir_all(&path).await.is_ok() {
-            tracing::debug!(path = %path.display(), "removed old Code Mode CLI");
+        if path != current && is_stale_build(&path).await && tokio::fs::remove_dir_all(&path).await.is_ok() {
+            tracing::debug!(path = %path.display(), "removed stale Code Mode CLI");
         }
+    }
+}
+
+async fn is_stale_build(dir: &Path) -> bool {
+    match tokio::fs::read(dir.join(SOURCE_FILE)).await {
+        Ok(bytes) => {
+            let source = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match source_key(&source).await {
+                Ok(key) => !name.starts_with(&format!("{key}-")),
+                Err(_) => true,
+            }
+        }
+        // No source file: a build being set up right now (no `claude` yet)
+        // is kept; a finished one without it predates source tracking.
+        Err(_) => tokio::fs::try_exists(dir.join("claude")).await.unwrap_or(false),
     }
 }
 

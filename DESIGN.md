@@ -1,13 +1,13 @@
 # claude-sdk-rs — Design Document
 
-> Source: decompiled Claude Code 2.1.328 (`learnSecurity/hackingtool/claude/readsrc/out/2.1.328/src/`).
-> Every claim carries a `file:line` citation and a confidence label (HIGH/MEDIUM/LOW).
+> Source: the Claude Code 2.1.328 binary (its bundled JS chunks, cited as `chunk-*.js:line`), the official Python SDK (claude_agent_sdk 0.1.48), and live runs.
+> Claims carry a citation and a confidence label (HIGH/MEDIUM/LOW).
 
 ---
 
 ## Why a New SDK
 
-Existing community Rust SDKs (e.g. `claude-rs`, `anthropic-sdk-rust`) expose 4–6 message types and spawn/kill a child process per request. Claude Code's internal TypeScript SDK (`chunk-f89nsf5q.query.js`) uses a **persistent subprocess** and exposes the full 30+ message protocol. This SDK closes that gap.
+Existing community Rust SDKs (e.g. `claude-rs`, `anthropic-sdk-rust`) expose 4–6 message types and spawn/kill a child process per request. Claude Code's internal TypeScript SDK (`chunk-f89nsf5q.query.js`) uses a **persistent subprocess** and the stream-json control protocol (hooks, permissions, in-process MCP, control requests). This SDK brings that model to Rust.
 
 ---
 
@@ -43,25 +43,35 @@ Source: `chunk-20bv8pca.js` (Zod schema file, 20 000+ lines)
 | `control_response` to `hook_callback` | line 19959–19979 | Hook output (approve/block/context) |
 | `control_response` to `can_use_tool` | — | Allow (with `updatedInput`) or deny a tool call |
 | `background_tasks` control | line 20970–20995 | Programmatically background an agent |
+| `interrupt`, `set_model`, `set_permission_mode`, `stop_task`, `get_context_usage` controls | binary control schemas | `Session` methods |
 
 ### Inbound (CLI → host)
 
-| Type | Subtype | Schema location | Notes |
-|---|---|---|---|
-| `system` | `init` | `chunk-hp1k7mph.js:202` | Per-turn metadata frame |
-| `assistant` | — | — | Model turn text |
-| `tool_use` | — | — | Tool call request |
-| `tool_result` | — | — | Tool call result |
-| `result` | `success` | line 14425–14913 | Turn complete, usage/timing |
-| `result` | `error_*` | — | Turn failed |
-| `hook_callback` | — | line 19959–19979 | Hook event needing approval |
-| `background_tasks_changed` | — | line 16351 | Level signal (replace semantics) |
-| `thinking_tokens` | — | line 16902 | Extended thinking partial |
-| `compact_boundary` | — | line 15408 | Context-compaction checkpoint |
-| `model_fallback` | — | line 15898 | Model switched |
-| `model_refusal_no_fallback` | — | line 15892 | Model refused, no fallback |
-| `peer_message_hold` | — | line 15972 | Multi-session coordination |
-| `stream_event` | — | — | Partial content (needs `--include-partial-messages`) |
+Top-level `type`s (`protocol::InboundMessage`):
+
+| Type | Notes |
+|---|---|
+| `system` | `subtype` selects the frame, see below |
+| `user` | Prompt echo (`isReplay: true`, carries the prompt's `uuid`) or tool results |
+| `assistant` | Complete message; content blocks `text`, `thinking`, `tool_use` |
+| `stream_event` | Partial content (needs `--include-partial-messages`) |
+| `result` | Turn complete: `success`, or `error_*` (line 14425–14913) |
+| `control_request` | CLI asks the host: `hook_callback` (line 19959–19979), `can_use_tool`, `mcp_message` |
+| `control_response` | Answer to a host control request (initialize, interrupt, …) |
+| `keep_alive` | Process keepalive |
+
+`system` subtypes:
+
+| Subtype | Schema location | Notes |
+|---|---|---|
+| `init` | `chunk-hp1k7mph.js:202` | Per-turn metadata (tools, model, …) |
+| `background_tasks_changed` | line 16351 | Level signal (replace semantics) |
+| `thinking_tokens` | line 16902 | Extended thinking partial |
+| `compact_boundary` | line 15408 | Context-compaction checkpoint |
+| `model_fallback` | line 15898 | Model switched |
+| `model_refusal_no_fallback` | line 15892 | Model refused, no fallback |
+| `peer_message_hold` | line 15972 | Multi-session coordination |
+| `task_started`, `task_updated`, `task_notification`, `hook_started`, `hook_response` | — | Task and hook progress |
 
 ---
 
@@ -121,13 +131,6 @@ Host → CLI: `{"type":"control_response","response":{"subtype":"success","reque
 
 `can_use_tool` (only with `--permission-prompt-tool stdio`) uses the same envelope; the answer is `{"behavior":"allow","updatedInput":{…}}` or `{"behavior":"deny","message":"…","interrupt"?}`.
 
-### Device Hook Registration (HIGH)
-
-Source: `chunk-zhqawkqb.createDeviceHooksWorker.js`
-
-Protocol: `register_device_hooks` with `instance_id`, `hooks[]`, `templates[]`, `worker_epoch`.
-Lease: 300 s. Response: `status`, `lease_s`, `lease_expires_at`, `accepted`, `ignored`, `ignored_ids`, `replaced_owner`.
-
 ---
 
 ## Code Mode (forced on through a patched CLI copy)
@@ -156,9 +159,11 @@ never get the `REPL` tool. The check also refuses:
    pointer zeroed, Bun compiles the patched source.
 4. On macOS, re-sign ad hoc with the stock entitlements (JIT). Without them the
    modified binary is killed.
-5. Cache the copy in `~/.cache/claude-sdk/code-mode/<name>-<size>-<mtime>/claude`.
-   The first spawn takes about 6 s; later spawns reuse the copy, and a CLI update
-   builds a new one.
+5. Cache the copy in `~/.cache/claude-sdk/code-mode/<name>-<size>-<mtime>-sdk<version>/claude`
+   (`$XDG_CACHE_HOME` when set). The first spawn takes about 6 s; later spawns reuse
+   the copy, and a CLI update or a new SDK version builds a new one. Each build
+   records its source path; a build whose source CLI changed or is gone is deleted,
+   so builds for other installed CLIs stay.
 
 The SDK also passes `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` in the process env and in
 `--settings` `env`. Verified live: `REPL` appears in `system/init.tools` and Claude
@@ -188,30 +193,13 @@ Set `ENABLE_TOOL_SEARCH=1` in subprocess env to activate. Distinct from Code Mod
 
 ---
 
-## `sdkMcpServerManifests` (HIGH)
-
-Source: `chunk-20bv8pca.js:17732–17752` (schema + docstring), `chunk-20bv8pca.js:18054` (response field `sdk_mcp_manifests_parked`)
-
-Pre-load MCP server handshake results in the `initialize` message to skip N×2 round-trips at startup. The docstring at 17747 says: *"MCP handshake results the host already obtained from its in-process servers by delivering initialize + notifications/initialized (+ tools/list) to them itself before writing this request. For each such server the CLI answers its own MCP client's initialize and first tools/list from these results and skips the notifications/initialized round trip."*
-
-Response field `sdk_mcp_manifests_parked` reports per-entry outcome: `"parked"` | `"already_connected"` | `"protocol_version_mismatch"` | `"malformed"` | `"not_honoured"` (`chunk-20bv8pca.js:18054`).
-
----
-
-## Semantic Compaction via `PreCompact` Hook (HIGH)
-
-Source: `chunk-20bv8pca.js` hook list; `compact_boundary` schema line 15408
-
-When context nears the limit, the CLI fires a `PreCompact` hook before compacting. The host can substitute a custom summary (from a separate summarizer session) instead of the default compaction. This enables semantic compaction.
-
----
-
 ## Architecture
 
 ```
 claude-sdk-rs/
 ├── src/
 │   ├── lib.rs
+│   ├── code_mode.rs     # patched CLI copy with Code Mode forced on, cached
 │   ├── protocol.rs      # wire types (control envelopes, frames, hook I/O)
 │   ├── session.rs       # process transport + reader/writer/watchdog, answers control requests
 │   ├── agent.rs         # one prompt → AgentEvent stream, tracing span per turn
@@ -270,11 +258,35 @@ not turned into the parent turn's `AgentEvent`s.
 
 ---
 
-## Closed Items (previously open)
+## Protocol notes (not implemented by the SDK)
 
-- **`Czn` alias** (`chunk-hp1k7mph.js:69–70`): `gt = "Agent"`, `sf = "Task"` from `chunk-6r0zxzh1.js:3,15`. The init frame renames the tool named `"Agent"` to `"Task"` in the displayed list — no impact on Code Mode detection.
-- **`sdkMcpServerManifests` wire format**: fully documented in `chunk-20bv8pca.js:17732–17752` — see section above.
-- **Workflow `task_type`**: `"local_workflow"` confirmed in `chunk-20bv8pca.js:16307–16311`.
+Found in the binary; the SDK does not use them yet.
+
+### `sdkMcpServerManifests` (HIGH)
+
+Source: `chunk-20bv8pca.js:17732–17752` (schema + docstring), `chunk-20bv8pca.js:18054` (response field `sdk_mcp_manifests_parked`)
+
+Pre-load MCP server handshake results in the `initialize` message to skip N×2 round-trips at startup. The docstring at 17747 says: *"MCP handshake results the host already obtained from its in-process servers by delivering initialize + notifications/initialized (+ tools/list) to them itself before writing this request. For each such server the CLI answers its own MCP client's initialize and first tools/list from these results and skips the notifications/initialized round trip."*
+
+Response field `sdk_mcp_manifests_parked` reports per-entry outcome: `"parked"` | `"already_connected"` | `"protocol_version_mismatch"` | `"malformed"` | `"not_honoured"` (`chunk-20bv8pca.js:18054`).
+
+
+### Semantic compaction via `PreCompact` (LOW: not verified)
+
+Source: `chunk-20bv8pca.js` hook list; `compact_boundary` schema line 15408
+
+When context nears the limit, the CLI fires a `PreCompact` hook before compacting. A host might steer or replace the summary from that hook; this is unverified. `compaction::compact` covers the verified path: `/compact <instructions>`.
+
+### Device hook registration (HIGH)
+
+Source: `chunk-zhqawkqb.createDeviceHooksWorker.js`
+
+Protocol: `register_device_hooks` with `instance_id`, `hooks[]`, `templates[]`, `worker_epoch`.
+Lease: 300 s. Response: `status`, `lease_s`, `lease_expires_at`, `accepted`, `ignored`, `ignored_ids`, `replaced_owner`.
+
+### Tool aliasing
+
+`chunk-hp1k7mph.js:69–70`: `gt = "Agent"`, `sf = "Task"` (`chunk-6r0zxzh1.js:3,15`). The init frame lists the tool `"Agent"` as `"Task"`.
 
 ## Open Items
 

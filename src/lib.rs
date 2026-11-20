@@ -1,4 +1,4 @@
-//! **claude-sdk** — Full-protocol Rust SDK for Claude Code.
+//! **claude-sdk** — Rust SDK for Claude Code.
 //!
 //! Drives the `claude` CLI (verified against 2.1.328) over its stream-json
 //! control protocol: one persistent process per session, Rust closures as
@@ -125,7 +125,7 @@ pub mod session;
 
 // ── Top-level re-exports ───────────────────────────────────────────────────────
 
-pub use agent::{Agent, AgentError, AgentEvent, TurnResult, TurnStream};
+pub use agent::{Agent, AgentError, AgentEvent, AgentStream, TurnResult};
 pub use hooks::HookRegistry;
 pub use mcp::{SdkMcpServer, SdkTool, ToolResult};
 /// `#[claude_tool]` — enable with the `macros` feature.

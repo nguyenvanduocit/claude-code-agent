@@ -1,8 +1,8 @@
-/// Agent layer — sends a turn and returns a streaming event iterator.
-///
-/// Control requests (hook callbacks, can_use_tool) are answered by the
-/// `Session` itself; this layer only turns frames into `AgentEvent`s until
-/// the turn's `result` arrives.
+//! Agent layer — sends a turn and returns a streaming event iterator.
+//!
+//! Control requests (hook callbacks, can_use_tool) are answered by the
+//! `Session` itself; this layer only turns frames into `AgentEvent`s until
+//! the turn's `result` arrives.
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -63,6 +63,7 @@ pub enum AgentError {
     Json(#[from] serde_json::Error),
 }
 
+/// Events of one turn; ends after `Done` or `Error`.
 pub type AgentStream = Pin<Box<dyn tokio_stream::Stream<Item = AgentEvent> + Send + 'static>>;
 
 // ─── Agent ────────────────────────────────────────────────────────────────────
@@ -236,6 +237,3 @@ fn to_events(msg: &InboundMessage, partial: bool) -> Vec<AgentEvent> {
         _ => vec![],
     }
 }
-
-// Re-export TurnStream as a type alias for external use.
-pub type TurnStream = AgentStream;

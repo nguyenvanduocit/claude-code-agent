@@ -1,14 +1,14 @@
-/// Deterministic record/replay — run the SDK without a CLI process or API cost.
-///
-/// Record: `SessionOptions::record = Some(path)` writes every stdout line of a
-/// live session to a JSONL file.
-/// Replay: `replay::replay(path, opts)` returns a `Session` backed by an
-/// in-memory fake CLI that answers `initialize` with the recorded response and
-/// plays back one recorded turn per user message.
-///
-/// Control requests the CLI made during recording (hooks, can_use_tool,
-/// mcp_message) are not replayed: their answers came from host code, which a
-/// replay does not re-run.
+//! Deterministic record/replay — run the SDK without a CLI process or API cost.
+//!
+//! Record: `SessionOptions::record = Some(path)` writes every stdout line of a
+//! live session to a JSONL file.
+//! Replay: `replay::replay(path, opts)` returns a `Session` backed by an
+//! in-memory fake CLI that answers `initialize` with the recorded response and
+//! plays back one recorded turn per user message.
+//!
+//! Control requests the CLI made during recording (hooks, can_use_tool,
+//! mcp_message) are not replayed: their answers came from host code, which a
+//! replay does not re-run.
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -67,6 +67,7 @@ impl Recording {
 /// Use the same `include_partial` as the recording.
 pub async fn replay(path: impl AsRef<Path>, opts: SessionOptions) -> Result<Session> {
     let recording = Recording::load(path).await?;
+    let record = crate::session::open_record(&opts).await?;
     let (host, cli) = tokio::io::duplex(1 << 16);
     let (host_out, host_in) = tokio::io::split(host);
     let fake = tokio::spawn(fake_cli(cli, recording));
@@ -75,7 +76,7 @@ pub async fn replay(path: impl AsRef<Path>, opts: SessionOptions) -> Result<Sess
         ExitInfo { code, stderr: String::new() }
     });
     let transport = Transport { stdin: Box::new(host_in), stdout: Box::new(host_out), exit, pgid: None };
-    Session::connect(transport, opts, Initialize::default()).await
+    Session::connect(transport, opts, Initialize::default(), record).await
 }
 
 async fn fake_cli(io: tokio::io::DuplexStream, recording: Recording) {
@@ -101,7 +102,8 @@ async fn fake_cli(io: tokio::io::DuplexStream, recording: Recording) {
                     json!({
                         "type": "result",
                         "subtype": "error_during_execution",
-                        "error": "replay exhausted: no recorded turn left",
+                        "is_error": true,
+                        "errors": ["replay exhausted: no recorded turn left"],
                     })
                     .to_string(),
                 ]

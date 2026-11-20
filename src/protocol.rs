@@ -1,6 +1,6 @@
-/// Wire types for the Claude Code stream-json protocol.
-/// Source: decompiled Claude Code 2.1.328 (chunk-20bv8pca.js, chunk-f89nsf5q.query.js).
-/// Every type carries a file:line citation.
+//! Wire types for the Claude Code stream-json protocol.
+//! Source: the Claude Code 2.1.328 binary's zod schemas and the official
+//! Python SDK (claude_agent_sdk 0.1.48); citations are on the types they cover.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -314,8 +314,8 @@ pub enum InboundMessage {
     /// Turn complete signal.
     #[serde(rename = "result")]
     Result(ResultMessage),
-    /// CLI asking host to approve/deny a tool call.
-    /// Source: chunk-20bv8pca.js:18214
+    /// CLI asking the host to answer: a hook callback, a tool permission
+    /// (`can_use_tool`) or an SDK MCP message. Source: chunk-20bv8pca.js:18214
     #[serde(rename = "control_request")]
     ControlRequest(ControlRequest),
     /// CLI answering a host-initiated control request (initialize, interrupt, …).
@@ -364,8 +364,7 @@ pub struct SystemMessage {
 }
 
 impl SystemMessage {
-    /// REPL/Eval in `tools[]` = Code Mode active. LOW confidence: not yet
-    /// observed live — stock 2.1.328 keeps Code Mode off (see SessionOptions::code_mode).
+    /// `REPL` or `Eval` in `tools[]` = Code Mode active (see `SessionOptions::code_mode`).
     pub fn code_mode_active(&self) -> bool {
         self.tools.iter().any(|t| t == "REPL" || t == "Eval")
     }

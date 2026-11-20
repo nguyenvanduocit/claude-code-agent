@@ -1,13 +1,13 @@
-/// In-process (SDK) MCP servers — Rust functions exposed to Claude as tools.
-///
-/// The CLI is told about each server with
-/// `--mcp-config {"mcpServers":{"<name>":{"type":"sdk","name":"<name>"}}}` and
-/// then forwards every JSON-RPC message for it as an `mcp_message` control
-/// request; the session answers with `{"mcp_response": <JSON-RPC response>}`.
-/// Claude sees the tools as `mcp__<server>__<tool>`.
-///
-/// Source: claude_agent_sdk 0.1.48 transport/subprocess_cli.py:240–260,
-///         _internal/query.py:305–320, :394–500
+//! In-process (SDK) MCP servers — Rust functions exposed to Claude as tools.
+//!
+//! The CLI is told about each server with
+//! `--mcp-config {"mcpServers":{"<name>":{"type":"sdk","name":"<name>"}}}` and
+//! then forwards every JSON-RPC message for it as an `mcp_message` control
+//! request; the session answers with `{"mcp_response": <JSON-RPC response>}`.
+//! Claude sees the tools as `mcp__<server>__<tool>`.
+//!
+//! Source: claude_agent_sdk 0.1.48 transport/subprocess_cli.py:240–260,
+//!         _internal/query.py:305–320, :394–500
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;

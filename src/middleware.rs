@@ -1,4 +1,4 @@
-/// Ready-made hook policies.
+//! Ready-made hook policies.
 use crate::hooks::HookRegistry;
 use crate::protocol::{HookEventKind, HookOutput};
 

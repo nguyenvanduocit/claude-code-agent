@@ -1,9 +1,10 @@
 [package]
 name = "claude-sdk-macros"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Proc macros for claude-sdk — #[claude_tool] generates ToolDef from async fn signatures"
 license = "MIT"
+repository = "https://github.com/nguyenvanduocit/claude-sdk-rs"
 
 [lib]
 proc-macro = true

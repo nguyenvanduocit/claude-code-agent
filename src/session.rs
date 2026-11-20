@@ -1,15 +1,15 @@
-/// Persistent subprocess session — 3-task architecture.
-///
-///   reader_task   — reads stdout; answers CLI control requests (hooks,
-///                   can_use_tool, mcp_message), routes control responses to
-///                   waiters, fans every other frame out to all subscribers
-///                   (one unbounded channel each: no frame is ever dropped)
-///   writer_task   — drains the stdin channel into the subprocess
-///   watchdog_task — waits for exit, marks the session dead, keeps stderr tail
-///
-/// Wire protocol verified against claude_agent_sdk 0.1.48
-/// (_internal/query.py, _internal/transport/subprocess_cli.py) and a live
-/// Claude Code 2.1.328 binary.
+//! Persistent subprocess session — 3-task architecture.
+//!
+//!   reader_task   — reads stdout; answers CLI control requests (hooks,
+//!                   can_use_tool, mcp_message), routes control responses to
+//!                   waiters, fans every other frame out to all subscribers
+//!                   (one unbounded channel each: no frame is ever dropped)
+//!   writer_task   — drains the stdin channel into the subprocess
+//!   watchdog_task — waits for exit, marks the session dead, keeps stderr tail
+//!
+//! Wire protocol verified against claude_agent_sdk 0.1.48
+//! (_internal/query.py, _internal/transport/subprocess_cli.py) and a live
+//! Claude Code 2.1.328 binary.
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
@@ -132,7 +132,8 @@ pub struct SessionOptions {
     /// Source: subprocess_cli.py:275–280
     pub setting_sources: Option<Vec<String>>,
     /// `--settings`: inline settings object (permissions, env, shell `hooks`, …),
-    /// or a string: path of a settings file.
+    /// or a string: path of a settings file (relative to `cwd`). With
+    /// `code_mode` the file is read and passed inline with the Code Mode env var.
     pub settings: Option<serde_json::Value>,
     /// Write every stdout line to this JSONL file, for `replay::replay`.
     pub record: Option<PathBuf>,
@@ -300,7 +301,14 @@ impl Session {
         if let Some(ref sources) = opts.setting_sources {
             cmd.args(["--setting-sources", &sources.join(",")]);
         }
-        match settings_arg(&opts)? {
+        let settings = match (&opts.settings, opts.code_mode) {
+            // The Code Mode env var must be merged into the settings object.
+            (Some(serde_json::Value::String(path)), true) => {
+                Some(read_settings_file(path, opts.cwd.as_deref()).await?)
+            }
+            (settings, _) => settings.clone(),
+        };
+        match settings_arg(settings, opts.code_mode)? {
             // A string is a settings file path; anything else is inline JSON.
             Some(serde_json::Value::String(path)) => {
                 cmd.args(["--settings", &path]);
@@ -331,6 +339,8 @@ impl Session {
         #[cfg(unix)]
         cmd.process_group(0);
 
+        // Before spawning, so a bad path leaves no process behind.
+        let record = open_record(&opts).await?;
         let mut child = cmd.spawn()?;
         let pgid = child.id().and_then(|id| i32::try_from(id).ok());
         let (Some(stdin), Some(stdout), Some(stderr)) =
@@ -351,12 +361,17 @@ impl Session {
             ExitInfo { code, stderr: Vec::from(tail).join("\n") }
         });
         let transport = Transport { stdin: Box::new(stdin), stdout: Box::new(stdout), exit, pgid };
-        Self::connect(transport, opts, init).await
+        Self::connect(transport, opts, init, record).await
     }
 
     /// Run the session over an already-started CLI (process or replay) and
     /// complete the initialize handshake.
-    pub(crate) async fn connect(transport: Transport, opts: SessionOptions, mut init: Initialize) -> Result<Self> {
+    pub(crate) async fn connect(
+        transport: Transport,
+        opts: SessionOptions,
+        mut init: Initialize,
+        record: Option<tokio::fs::File>,
+    ) -> Result<Self> {
         let Transport { stdin, stdout, exit: exit_fut, pgid } = transport;
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(256);
         let fanout = Arc::new(std::sync::Mutex::new(Fanout::default()));
@@ -387,10 +402,6 @@ impl Session {
             let _ = exit_tx.send(Some(info));
         });
 
-        let record = match &opts.record {
-            Some(path) => Some(tokio::fs::File::create(path).await?),
-            None => None,
-        };
         let responder = Arc::new(Responder {
             stdin_tx: stdin_tx.downgrade(),
             hooks: opts.hooks.clone(),
@@ -653,13 +664,31 @@ fn decrement(n: &AtomicUsize) {
     }
 }
 
+/// The file `SessionOptions::record` names, created (truncated) for writing.
+pub(crate) async fn open_record(opts: &SessionOptions) -> Result<Option<tokio::fs::File>> {
+    match &opts.record {
+        Some(path) => Ok(Some(tokio::fs::File::create(path).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Settings file contents; a relative path is resolved against `cwd`, as
+/// the CLI started in `cwd` would.
+async fn read_settings_file(path: &str, cwd: Option<&std::path::Path>) -> Result<serde_json::Value> {
+    let path = match cwd {
+        Some(dir) => dir.join(path),
+        None => PathBuf::from(path),
+    };
+    Ok(serde_json::from_slice(&tokio::fs::read(path).await?)?)
+}
+
 /// `--settings` value: the caller's settings, plus the Code Mode env var,
 /// which the CLI honours only when it comes from settings, not the shell.
-fn settings_arg(opts: &SessionOptions) -> Result<Option<serde_json::Value>> {
-    if !opts.code_mode {
-        return Ok(opts.settings.clone());
+fn settings_arg(settings: Option<serde_json::Value>, code_mode: bool) -> Result<Option<serde_json::Value>> {
+    if !code_mode {
+        return Ok(settings);
     }
-    let mut settings = opts.settings.clone().unwrap_or_else(|| serde_json::json!({}));
+    let mut settings = settings.unwrap_or_else(|| serde_json::json!({}));
     let env = settings
         .as_object_mut()
         .map(|obj| obj.entry("env").or_insert_with(|| serde_json::json!({})))
