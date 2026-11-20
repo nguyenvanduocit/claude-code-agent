@@ -6,7 +6,7 @@ Rust SDK for [Claude Code](https://claude.ai/claude-code). It drives the `claude
 - every `claude --help` flag an SDK session can use, as a typed `SessionOptions` field (`extra_args` for the rest)
 - every public control request as a `Session` method: model, effort, thinking, permission mode, interrupt, MCP servers, settings, usage, rewind, …
 - a lossless event stream: text, thinking, tool calls and their results, subagent events, every `system` frame, the full turn result
-- hook callbacks, `can_use_tool`, MCP elicitation and user-dialog handlers as async Rust closures
+- hook callbacks, `can_use_tool`, MCP elicitation and questions from the CLI as async Rust closures
 - Rust functions as tools (`#[claude_tool]` + SDK MCP bridge), executed in-process, cancellable
 - Code Mode (`REPL` tool) forced on with `code_mode: true`
 - text, image and document prompts (`UserMessage::blocks`)
@@ -137,7 +137,7 @@ Structured output: set `Initialize::json_schema`; the parsed value arrives in `T
 
 Dropping a turn's stream before `Done`/`Error` cancels the prompt: a queued prompt is withdrawn, a running one is interrupted. Another prompt's turn is never touched. `Session::cancel_prompt(uuid)` does the same explicitly; `Session::interrupt()` stops whatever runs; `Session::interrupt_all()` also cancels every queued prompt. A prompt withdrawn before it ran ends its stream with `TurnErrorKind::Cancelled`. A prompt sent with `UserMessage::with_priority(Priority::Now)` aborts the running turn and runs at once; the aborted turn ends with `Done` and `terminal_reason: "aborted_streaming"`.
 
-When the CLI withdraws a request it asked the host (e.g. `can_use_tool` during an interrupt), the handler's future is dropped and no answer is sent. An interrupted SDK tool call drops its handler the same way.
+If the CLI takes back a question it asked your app (for example a `can_use_tool` check during an interrupt), your handler is stopped and nothing is sent. The same happens to your own tool when its call is interrupted.
 
 ## MCP servers
 
@@ -191,44 +191,38 @@ Experimental and unsupported by Anthropic: Code Mode is gated server-side, and t
 | `on_stderr` | every CLI stderr line, live |
 | `extra_args` | flags without a field |
 
-## Keeping up with the CLI
-
-`python3 -I scripts/cli-parity.py` lists every `claude --help` flag and public control request the SDK does not cover (exit 1 when any is left). Deliberate omissions, each with its reason, are in `scripts/cli-parity-ignore.txt`. Run it after each Claude Code update.
-
 ## Hook events
 
-`HookEventKind` has all 33 event names in the 2.1.328 binary. Observed firing for SDK callbacks in a live run (`examples/hook_coverage.rs`): PreToolUse, PostToolUse, PostToolUseFailure, PostToolBatch, UserPromptSubmit, SessionStart, Stop, SubagentStart, SubagentStop, PreCompact, PostCompact, MessageDisplay. CwdChanged and FileChanged reach shell hooks in settings but not SDK callbacks. The others need situations that run did not produce (elicitation, worktrees, teammates, …).
+`HookEventKind` lists all 33 hook events of the CLI. These work with SDK hook callbacks: PreToolUse, PostToolUse, PostToolUseFailure, PostToolBatch, UserPromptSubmit, SessionStart, Stop, SubagentStart, SubagentStop, PreCompact, PostCompact, MessageDisplay. CwdChanged and FileChanged only reach shell hooks in your settings, not SDK callbacks. The rest fire only in less common situations (elicitation, worktrees, teammates, …).
 
 `PreToolUse` · `PostToolUse` · `PostToolUseFailure` · `PostToolBatch` · `UserPromptSubmit` · `UserPromptExpansion` · `SessionStart` · `SessionEnd` · `Stop` · `StopFailure` · `SubagentStart` · `SubagentStop` · `PreCompact` · `PostCompact` · `PreModelSwitch` · `PostModelSwitch` · `PermissionRequest` · `PermissionDenied` · `Setup` · `TeammateIdle` · `TaskCreated` · `TaskCompleted` · `Elicitation` · `ElicitationResult` · `ConfigChange` · `WorktreeCreate` · `WorktreeRemove` · `InstructionsLoaded` · `CwdChanged` · `FileChanged` · `DirectoryAdded` · `MessageDisplay` · `Notification`
 
-## User dialogs
+## Questions from the CLI
 
-Some CLI flows stop and ask the host app a question (`request_user_dialog`). Declare the kinds your app renders and answer from `on_user_dialog`; the CLI sends no other kind.
+Sometimes the CLI needs a decision from the person using your app before it can go on. For example, the model refused a request, and the CLI could retry it on your fallback model. Without a handler the CLI never asks; it takes the safe default instead. To ask your user, list the questions your app can show and answer them in `on_user_dialog`:
 
 ```rust
 let opts = SessionOptions {
+    fallback_model: Some("claude-opus-4-8".into()),
     on_user_dialog: Some(OnUserDialog::new(|d| async move {
         match d.dialog_kind.as_str() {
-            "auto_mode_server_fallback" => UserDialogResponse::completed("continue"),
+            // Ask your user here; this example always retries.
+            "refusal_fallback_prompt" => UserDialogResponse::completed("retry_fallback"),
             _ => UserDialogResponse::cancelled(),
         }
     })),
     ..Default::default()
 };
-let init = Initialize { supported_dialog_kinds: Some(vec!["auto_mode_server_fallback".into()]), ..Default::default() };
+let init = Initialize { supported_dialog_kinds: Some(vec!["refusal_fallback_prompt".into()]), ..Default::default() };
 ```
 
-CLI 2.1.329 routes these kinds to an SDK host. The handler receives every kind the same way; the table says what each answer does.
-
-| Kind | When | Answers | Checked against the real CLI |
+| Question (`dialog_kind`) | When the CLI asks | Answers | Without a handler |
 |---|---|---|---|
-| `auto_mode_server_fallback` | auto mode falls back to billed classifier requests (e.g. API key behind a gateway) | `"continue"` runs the classifier; `"interrupt"` and `cancelled()` reject the tool call and end the turn | yes |
-| `refusal_fallback_prompt` | a model refuses and a fallback model is set | `"retry_fallback"` retries on the fallback model; `"edit_prompt"` and `cancelled()` end the turn with the refusal | yes |
-| `fable_overage_consent_prompt` | a subscription reaches its Fable usage limit | per payload; an answer can turn on overage billing | no: a real account below its limit gets no dialog |
-| `send_to_project_remote_control_offer` | sending to another project needs Remote Control | `"turned_on"`, `"already_on"`, `"declined"`, `"failed"` | not sent to SDK sessions: 2.1.329 refuses `/send-to-project` there ("isn't available in this environment") |
-| `enum_prompt` | routed, but no flow in 2.1.329 sends it | per payload | not sent by 2.1.329 |
+| `refusal_fallback_prompt` | The model refused the request and `fallback_model` is set. | `completed("retry_fallback")` retries on the fallback model. `completed("edit_prompt")` or `cancelled()` ends the turn with the refusal. | The turn ends with the refusal. |
+| `auto_mode_server_fallback` | In auto mode, checking tool calls now costs extra API requests (for example, an API key behind a gateway). | `completed("continue")` pays for the checks and goes on. `completed("interrupt")` or `cancelled()` blocks the tool call and ends the turn. | The checks run and are billed. |
+| `fable_overage_consent_prompt` | Your subscription reached its Fable usage limit. | See `d.payload`. An answer can turn on overage billing. | The CLI does not ask. |
 
-`cancelled()` means the user dismissed the dialog; the CLI applies the dialog's default.
+`cancelled()` means your user closed the question without choosing.
 
 ## Limitations
 
@@ -248,6 +242,8 @@ git tag -a v0.6.1 -m v0.6.1 && git push origin v0.6.1
 ```
 
 `.github/workflows/release.yml` runs the CI checks on Linux, macOS and Windows, then publishes both crates through crates.io Trusted Publishing. No token is stored in the repository.
+
+After a Claude Code update, run `python3 -I scripts/cli-parity.py`. It lists the CLI flags and requests the SDK does not support yet; deliberate omissions and their reasons are in `scripts/cli-parity-ignore.txt`.
 
 ## License
 
