@@ -127,17 +127,24 @@ impl ToolResult {
 pub struct ToolContext {
     /// The model's `tool_use` id for this call.
     pub tool_use_id: Option<String>,
-    /// The session id (`claudecode/sessionId` in `_meta`).
+    /// The session's id: `claudecode/sessionId` in `_meta` when the CLI
+    /// sends it (behind a CLI feature flag), else the id the session last
+    /// reported. `None` only outside a session (`SdkMcpServer::handle`) or
+    /// before the CLI's first `system` frame.
     pub session_id: Option<String>,
     /// The request's raw `_meta` object.
     pub meta: Value,
 }
 
 impl ToolContext {
-    fn from_params(params: Option<&Value>) -> Self {
+    fn from_params(params: Option<&Value>, session_id: Option<String>) -> Self {
         let meta = params.and_then(|p| p.get("_meta")).cloned().unwrap_or(Value::Null);
         let field = |k: &str| meta.get(k).and_then(Value::as_str).map(str::to_owned);
-        Self { tool_use_id: field("claudecode/toolUseId"), session_id: field("claudecode/sessionId"), meta }
+        Self {
+            tool_use_id: field("claudecode/toolUseId"),
+            session_id: field("claudecode/sessionId").or(session_id),
+            meta,
+        }
     }
 }
 
@@ -192,6 +199,8 @@ pub struct SdkMcpServer {
     pub timeout: Option<Duration>,
     tools: Vec<SdkTool>,
     /// Running `tools/call`s by JSON-RPC id; firing one cancels the call.
+    /// One map per session (`for_session`): every CLI numbers its requests
+    /// from 0, so ids from two sessions collide.
     in_flight: Arc<DashMap<String, oneshot::Sender<()>>>,
 }
 
@@ -227,6 +236,12 @@ impl SdkMcpServer {
         self.tools.iter().map(|t| format!("mcp__{}__{}", self.name, t.def.name)).collect()
     }
 
+    /// A copy of this server with its own in-flight call registry, for one
+    /// session. Clones share the registry.
+    pub(crate) fn for_session(&self) -> Self {
+        Self { in_flight: Arc::new(DashMap::new()), ..self.clone() }
+    }
+
     /// This server's entry in an MCP server map (`--mcp-config`, `mcp_set_servers`).
     pub(crate) fn config(&self) -> Value {
         let mut config = json!({ "type": "sdk", "name": self.name });
@@ -239,6 +254,11 @@ impl SdkMcpServer {
     /// Answer one JSON-RPC message from the CLI. Notifications get an empty
     /// result: the control channel answers every `mcp_message`.
     pub async fn handle(&self, message: &Value) -> Value {
+        self.handle_in_session(message, None).await
+    }
+
+    /// `handle`, with the id of the session the message came from.
+    pub(crate) async fn handle_in_session(&self, message: &Value, session_id: Option<String>) -> Value {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let params = message.get("params");
@@ -261,12 +281,12 @@ impl SdkMcpServer {
                 let tools: Vec<Value> = self.tools.iter().map(|t| tool_listing(&t.def)).collect();
                 rpc_result(id, json!({ "tools": tools }))
             }
-            "tools/call" => self.call_tool(id, params).await,
+            "tools/call" => self.call_tool(id, params, session_id).await,
             other => rpc_error(id, -32601, &format!("Method '{other}' not found")),
         }
     }
 
-    async fn call_tool(&self, id: Value, params: Option<&Value>) -> Value {
+    async fn call_tool(&self, id: Value, params: Option<&Value>, session_id: Option<String>) -> Value {
         let name = params.and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("");
         let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or_else(|| json!({}));
         let Some(tool) = self.tools.iter().find(|t| t.def.name == name) else {
@@ -277,7 +297,7 @@ impl SdkMcpServer {
         self.in_flight.insert(key.clone(), cancel_tx);
         // Unregisters also when this future is dropped mid-call.
         let _registered = InFlightGuard { in_flight: &self.in_flight, key: &key };
-        let run = (tool.handler)(args, ToolContext::from_params(params));
+        let run = (tool.handler)(args, ToolContext::from_params(params, session_id));
         let outcome = tokio::select! {
             result = run => Some(result),
             Ok(()) = cancel_rx => None,

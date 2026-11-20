@@ -93,6 +93,19 @@ pub enum CodeModeError {
     /// Code Mode was requested on a platform other than macOS or Linux.
     #[error("Code Mode is supported on macOS and Linux only")]
     UnsupportedPlatform,
+    /// Neither `XDG_CACHE_HOME` nor `HOME` is an absolute path, so there is
+    /// no per-user directory to cache the patched CLI in.
+    #[error("no per-user cache directory for the Code Mode CLI: set HOME or XDG_CACHE_HOME to an absolute path")]
+    NoCacheDir,
+    /// Another user could write the cache directory or the cached CLI, so
+    /// the SDK refuses to run it.
+    #[error("refusing the Code Mode cache at {path}: {reason}")]
+    UnsafeCache {
+        /// The directory or file that failed the check.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
 }
 
 // ─── Functional core ─────────────────────────────────────────────────────────
@@ -192,21 +205,25 @@ static BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Path of a patched copy of `binary` (resolved through `PATH`), built on
 /// first use and cached under `<cache>/claude-code-agent/code-mode/`. The cache key
 /// is the installed binary's name, size and mtime plus this SDK's version,
-/// so a CLI update or a new patch builds a new copy.
+/// so a CLI update or a new patch builds a new copy. The cache must be
+/// private to the current user (see [`CodeModeError::UnsafeCache`]).
 pub async fn patched_binary(binary: &Path) -> Result<PathBuf, CodeModeError> {
     if cfg!(windows) {
         return Err(CodeModeError::UnsupportedPlatform);
     }
     let source = tokio::fs::canonicalize(resolve(binary)).await?;
     let key = source_key(&source).await?;
-    let target = cache_dir().join(format!("{key}-sdk{}", env!("CARGO_PKG_VERSION"))).join("claude");
+    let base = cache_base()?;
+    let dir = base.join(CACHE_SUBDIR).join(format!("{key}-sdk{}", env!("CARGO_PKG_VERSION")));
+    let target = dir.join("claude");
 
     let _guard = BUILD.lock().await;
+    secure_cache_dirs(&base, &dir).await?;
+    remove_dead_partials(&dir).await;
     if tokio::fs::try_exists(&target).await? {
+        secure_cached_binary(&target).await?;
         return Ok(target);
     }
-    let dir = target.parent().ok_or(CodeModeError::NotBunBinary("cache path"))?;
-    tokio::fs::create_dir_all(dir).await?;
     // Read by prune_stale_builds in any process: the build is stale once
     // this source changes or disappears.
     tokio::fs::write(dir.join(SOURCE_FILE), source.to_string_lossy().as_bytes()).await?;
@@ -215,8 +232,9 @@ pub async fn patched_binary(binary: &Path) -> Result<PathBuf, CodeModeError> {
     let patched = tokio::task::spawn_blocking(move || patch(&original))
         .await
         .map_err(|e| CodeModeError::Io(std::io::Error::other(e)))??;
-    // Write to a name unique to this build, then rename: neither a crash nor
-    // another process building at the same time leaves a half copy.
+    // Write to a name unique to this build (pid first, for
+    // remove_dead_partials), then rename: neither a crash nor another process
+    // building at the same time leaves a half copy at `target`.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -233,7 +251,7 @@ pub async fn patched_binary(binary: &Path) -> Result<PathBuf, CodeModeError> {
         return Err(e);
     }
     tokio::fs::rename(&partial, &target).await?;
-    prune_stale_builds(dir).await;
+    prune_stale_builds(&dir).await;
     tracing::info!(source = %source.display(), patched = %target.display(), "built Code Mode CLI");
     Ok(target)
 }
@@ -306,12 +324,112 @@ async fn remove_leftover(path: &Path) {
     }
 }
 
-fn cache_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("claude-code-agent").join("code-mode")
+/// Builds live in `<cache base>/claude-code-agent/code-mode/<build>/`.
+const CACHE_SUBDIR: &str = "claude-code-agent/code-mode";
+
+/// `$XDG_CACHE_HOME`, else `$HOME/.cache`; relative values are ignored, as
+/// the XDG spec requires. There is no shared fallback such as `/tmp`: another
+/// local user could plant a binary there that the host would then run.
+fn cache_base() -> Result<PathBuf, CodeModeError> {
+    let absolute = |var| std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute());
+    absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|h| h.join(".cache"))).ok_or(CodeModeError::NoCacheDir)
+}
+
+/// Create `build` (mode 0700) and make sure no other user can write any
+/// directory from `base` down to it, so a cached binary there is ours.
+/// `base` must be ours; it may be group writable (the norm with per-user
+/// groups, umask 002) but not world writable (like `/tmp`), where any user
+/// could swap the SDK's directories. Those must be ours too; they are set
+/// to 0700.
+#[cfg(unix)]
+async fn secure_cache_dirs(base: &Path, build: &Path) -> Result<(), CodeModeError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut private = tokio::fs::DirBuilder::new();
+    private.recursive(true).mode(0o700);
+    private.create(base).await?;
+    // Followed if a symlink: the directory it names must be ours.
+    let base_meta = tokio::fs::metadata(base).await?;
+    owned_by_us(base, &base_meta)?;
+    if base_meta.permissions().mode() & 0o002 != 0 {
+        return Err(CodeModeError::UnsafeCache { path: base.into(), reason: "world writable" });
+    }
+    private.create(build).await?;
+    for dir in build.ancestors().take_while(|d| *d != base) {
+        let meta = tokio::fs::symlink_metadata(dir).await?;
+        if !meta.is_dir() {
+            return Err(CodeModeError::UnsafeCache { path: dir.into(), reason: "not a directory" });
+        }
+        owned_by_us(dir, &meta)?;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn secure_cache_dirs(_base: &Path, build: &Path) -> Result<(), CodeModeError> {
+    Ok(tokio::fs::create_dir_all(build).await?)
+}
+
+/// Refuse a cached binary that is a symlink or that we do not own.
+#[cfg(unix)]
+async fn secure_cached_binary(binary: &Path) -> Result<(), CodeModeError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = tokio::fs::symlink_metadata(binary).await?;
+    if !meta.is_file() {
+        return Err(CodeModeError::UnsafeCache { path: binary.into(), reason: "not a regular file" });
+    }
+    owned_by_us(binary, &meta)?;
+    Ok(tokio::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).await?)
+}
+
+#[cfg(not(unix))]
+async fn secure_cached_binary(_binary: &Path) -> Result<(), CodeModeError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn owned_by_us(path: &Path, meta: &std::fs::Metadata) -> Result<(), CodeModeError> {
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() == nix::unistd::geteuid().as_raw() {
+        Ok(())
+    } else {
+        Err(CodeModeError::UnsafeCache { path: path.into(), reason: "owned by another user" })
+    }
+}
+
+/// Delete temporary files (`claude.<pid>.…`) left in `dir` by a build that
+/// died mid-way. The caller holds [`BUILD`], so this process's own files are
+/// leftovers; another process's are leftovers once that pid is gone. A live
+/// pid's files stay, since that process may be building right now; a reused
+/// pid only delays the cleanup to a later build.
+async fn remove_dead_partials(dir: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return };
+    let me = std::process::id();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(pid) = entry.file_name().to_str().and_then(builder_pid) else { continue };
+        if pid == me || !process_alive(pid) {
+            remove_leftover(&entry.path()).await;
+        }
+    }
+}
+
+/// The builder pid in a temporary file name `claude.<pid>.<nanos>.…`.
+fn builder_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("claude.")?.split('.').next()?.parse().ok()
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+    match i32::try_from(pid) {
+        Ok(raw) if raw > 0 => kill(Pid::from_raw(raw), None) != Err(Errno::ESRCH),
+        _ => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 /// macOS kills a modified binary unless it is re-signed; the stock

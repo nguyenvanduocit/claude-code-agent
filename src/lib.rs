@@ -120,6 +120,8 @@ pub mod hooks;
 pub mod mcp;
 pub mod middleware;
 pub mod pool;
+#[cfg(unix)]
+mod process_tree;
 pub mod protocol;
 pub mod replay;
 pub mod session;
@@ -160,4 +162,96 @@ pub use session::{
 #[doc(hidden)]
 pub mod __private {
     pub use serde_json;
+
+    /// Turns a tool fn's return value into a [`ToolResult`](crate::ToolResult)
+    /// by its type, not its spelling (so `type MyRes<T> = Result<T, E>` is
+    /// still a `Result`). Generated code runs
+    /// `(&value).__claude_tool_kind().convert(value)`: the impls on `Result`,
+    /// `ToolResult` and `()` match `&V` directly and win over the
+    /// `Serialize` fallback, which needs one more auto-ref.
+    pub mod ret {
+        use crate::ToolResult;
+        use serde::Serialize;
+        use std::fmt::Display;
+
+        /// `Result<T, E>`: `T` as JSON, or an error result with `E: Display`.
+        pub struct ResultTag;
+        /// `ToolResult`: passed through.
+        pub struct ToolResultTag;
+        /// `()`: the text "ok".
+        pub struct UnitTag;
+        /// Anything else: serde JSON, strings verbatim.
+        pub struct SerializeTag;
+
+        /// Selects [`ResultTag`].
+        pub trait ResultKind {
+            #[inline]
+            fn __claude_tool_kind(&self) -> ResultTag {
+                ResultTag
+            }
+        }
+        impl<T, E> ResultKind for Result<T, E> {}
+
+        /// Selects [`ToolResultTag`].
+        pub trait ToolResultKind {
+            #[inline]
+            fn __claude_tool_kind(&self) -> ToolResultTag {
+                ToolResultTag
+            }
+        }
+        impl ToolResultKind for ToolResult {}
+
+        /// Selects [`UnitTag`].
+        pub trait UnitKind {
+            #[inline]
+            fn __claude_tool_kind(&self) -> UnitTag {
+                UnitTag
+            }
+        }
+        impl UnitKind for () {}
+
+        /// Selects [`SerializeTag`].
+        pub trait SerializeKind {
+            #[inline]
+            fn __claude_tool_kind(&self) -> SerializeTag {
+                SerializeTag
+            }
+        }
+        impl<T: ?Sized> SerializeKind for &T {}
+
+        fn serialize<T: Serialize + ?Sized>(value: &T) -> ToolResult {
+            match serde_json::to_value(value) {
+                Ok(v) => ToolResult::from_value(v),
+                Err(e) => ToolResult::error(e.to_string()),
+            }
+        }
+
+        impl ResultTag {
+            /// Convert the returned `Result`.
+            pub fn convert<T: Serialize, E: Display>(self, value: Result<T, E>) -> ToolResult {
+                match value {
+                    Ok(v) => serialize(&v),
+                    Err(e) => ToolResult::error(e.to_string()),
+                }
+            }
+        }
+        impl ToolResultTag {
+            /// Pass the returned `ToolResult` through.
+            pub fn convert(self, value: ToolResult) -> ToolResult {
+                value
+            }
+        }
+        impl UnitTag {
+            /// Convert the returned `()`.
+            pub fn convert(self, _: ()) -> ToolResult {
+                ToolResult::text("ok")
+            }
+        }
+        impl SerializeTag {
+            /// Convert any other returned value.
+            pub fn convert<T: Serialize>(self, value: T) -> ToolResult {
+                serialize(&value)
+            }
+        }
+    }
 }

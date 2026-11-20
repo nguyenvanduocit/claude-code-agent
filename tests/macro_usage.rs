@@ -88,4 +88,49 @@ mod macro_integration {
         let hi = call(&server, "greet", serde_json::json!({ "name": "rust" })).await;
         assert_eq!(hi["content"][0]["text"], "hello rust");
     }
+
+    type CheckResult<T> = Result<T, String>;
+
+    /// Fails through a `Result` alias
+    #[claude_tool]
+    async fn always_fails() -> CheckResult<u32> {
+        Err("disk on fire".into())
+    }
+
+    /// Show a path
+    #[claude_tool]
+    fn show_path(path: std::path::PathBuf, base: &std::path::Path, tags: &[String]) -> String {
+        format!("{} {} {}", base.join(path).display(), tags.len(), tags.join(","))
+    }
+
+    /// Echo any JSON
+    #[claude_tool]
+    fn echo(value: serde_json::Value) -> serde_json::Value {
+        value
+    }
+
+    #[tokio::test]
+    async fn alias_result_err_is_an_error_result() {
+        let server = claude_code_agent::SdkMcpServer::new("t").tool(always_fails_tool());
+        let err = call(&server, "always_fails", serde_json::json!({})).await;
+        assert_eq!(err["content"][0]["text"], "disk on fire");
+        assert_eq!(err["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn path_and_any_params_have_matching_schema_and_decode() {
+        let schema = show_path_tool_def().input_schema.unwrap();
+        assert_eq!(schema["properties"]["path"], serde_json::json!({ "type": "string" }));
+        assert_eq!(schema["properties"]["base"], serde_json::json!({ "type": "string" }));
+        assert_eq!(schema["properties"]["tags"], serde_json::json!({ "type": "array", "items": { "type": "string" } }));
+        let schema = echo_tool_def().input_schema.unwrap();
+        assert_eq!(schema["properties"]["value"], serde_json::json!({}));
+
+        let server = claude_code_agent::SdkMcpServer::new("t").tool(show_path_tool()).tool(echo_tool());
+        let shown = call(&server, "show_path", serde_json::json!({ "path": "b.txt", "base": "/a", "tags": ["x", "y"] })).await;
+        assert_eq!(shown["content"][0]["text"], "/a/b.txt 2 x,y");
+        assert!(shown.get("isError").is_none());
+        let echoed = call(&server, "echo", serde_json::json!({ "value": { "k": [1, 2] } })).await;
+        assert_eq!(echoed["content"][0]["text"], r#"{"k":[1,2]}"#);
+    }
 }

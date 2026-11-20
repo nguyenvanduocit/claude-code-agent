@@ -164,6 +164,19 @@ never get the `REPL` tool. The check also refuses:
    the copy, and a CLI update or a new SDK version builds a new one. Each build
    records its source path; a build whose source CLI changed or is gone is deleted,
    so builds for other installed CLIs stay.
+6. Trust the cache only while it is private. With neither `$XDG_CACHE_HOME` nor `$HOME`
+   set to an absolute path, spawning fails with `CodeModeError::NoCacheDir`; there is
+   no shared fallback such as `/tmp`, where another user could plant a binary. On every
+   spawn the cache base must be owned by the current user and not be world writable
+   (group writable is the norm with per-user groups), the SDK's directories and the
+   cached `claude` must be owned by the current user too, and they are set to 0700 and 0755. Anything else, or a symlinked
+   binary, fails with `CodeModeError::UnsafeCache`.
+   Before patching, `claude --version` is checked against `MIN_CLI_VERSION`, so an old
+   CLI fails with `SessionError::UnsupportedCliVersion` rather than an anchor error.
+7. Build into `claude.<pid>.<nanos>.partial` and rename it to `claude`. Under the build
+   lock, every spawn deletes temporary files whose pid is this process or no longer
+   alive, so a host killed mid-build leaves no 360 MB file behind. Files of a live pid
+   stay, since another host process may be building into the same directory.
 
 The SDK also passes `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` in the process env and in
 `--settings` `env`. Verified live: `REPL` appears in `system/init.tools` and Claude
@@ -250,25 +263,49 @@ ends its stream. A prompt cancelled while queued gets neither: the CLI sends
 
 ## Lifecycle
 
-The CLI runs in its own process group (`process_group(0)`), so tools it starts (Bash,
-background tasks) are in that group too. The Session owns the only strong stdin
-sender. `close()` closes stdin and waits up to 5 s for the CLI to exit; a CLI kept
-alive by background tasks then gets SIGTERM, then SIGKILL, sent to the whole group,
-and a final SIGTERM to the group ends leftover children. Dropping the last Session
-clone sends SIGTERM to the group if the CLI is still running, and SIGKILL 5 s later
-if it still is (when a Tokio runtime is there to wait). On Windows the same steps
-use `taskkill /T /F` on the CLI's process tree.
+The CLI runs in its own process group (`process_group(0)`); children it starts plainly
+(MCP servers, background tasks) share it. Hooks and Bash tools do not: the CLI starts
+each with Node's `detached: true`, in a process group of its own (verified live: a
+foreground Bash tool survived a group-only kill). While the CLI runs they are its
+descendants, so `close()` reads the process table (`/proc` on Linux, `ps` elsewhere;
+`process_tree.rs`) and collects the groups of every descendant: before closing stdin,
+since an exited CLI's tools lose their parent link, and again before each signal.
 
-Exit is detected from the process, not from stderr EOF: a tool the CLI started can
-inherit stderr and hold it open after the CLI is gone. stderr drains in its own task;
-after the exit it gets 500 ms to deliver its last lines. A panicking `on_stderr` is
-logged and the drain continues.
+`close()` closes stdin and waits up to 5 s for the CLI to exit; a CLI kept alive by
+background tasks then gets SIGTERM, then SIGKILL, sent to its group. Then the CLI's
+group and the collected tool groups get SIGTERM, and SIGKILL after 2 s if still there.
+Dropping the last Session clone does the same from a spawned task when a Tokio runtime
+is there (without one, only SIGTERM to the CLI's group). The CLI's group is signalled
+even when the CLI already died, for the children it left (MCP servers). On Windows the
+same steps use `taskkill /T /F` on the CLI's process tree.
 
-When stdout ends, or the reader task panics, a drop guard ends every subscriber
-stream, fails every pending control request, and aborts the handlers still running
-for the CLI's control requests (a `can_use_tool` waiting on a UI has no CLI left to
-answer). Handlers are owned by the session, so one that captures a `Session` keeps it
-alive forever; handlers capture `Session::downgrade()` instead.
+Out of reach: a process that a hook or tool detached and that outlived it (`(cmd &)` in
+a hook, `nohup cmd &`). Its parent is gone and its group and session are its own, so
+nothing links it to the CLI. macOS does not expose other processes' environment for
+system binaries, so an environment marker cannot find it either (tried).
+
+Exit is detected from the process, not from stderr or stdout EOF: a tool the CLI
+started can inherit either pipe and hold it open after the CLI is gone. `is_alive()`
+turns false at the exit. stderr drains in its own task and gets 500 ms after the exit
+to deliver its last lines; a panicking `on_stderr` is logged and the drain continues.
+After the exit is recorded the reader keeps reading stdout only while lines keep
+coming (100 ms each), then ends as at EOF.
+
+When stdout ends, the CLI exits, or the reader task panics, a drop guard ends every
+subscriber stream, fails every pending control request, and aborts the handlers still
+running for the CLI's control requests (a `can_use_tool` waiting on a UI has no CLI
+left to answer). Handlers are owned by the session, so one that captures a `Session`
+keeps it alive forever; handlers capture `Session::downgrade()` instead.
+
+Every control request, its stdin write included, is bounded by `control_timeout`: a
+hung CLI stops reading stdin and the pipe fills. The count of prompts in flight
+(`is_busy()`, the pool's reset check) survives cancellation: a prompt future dropped
+before its write uncounts it, and `interrupt_all` / `cancel_prompt` finish their count
+fix-up in their own task.
+
+Each session gets its own copy of every `SdkMcpServer`'s cancel registry: each CLI
+numbers its JSON-RPC requests from 0, so one registry shared by pooled sessions let a
+cancel from one session stop another's call.
 
 ## Event fanout
 

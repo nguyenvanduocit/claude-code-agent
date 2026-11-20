@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::protocol::Initialize;
-use crate::session::{ExitInfo, Result, Session, SessionError, SessionOptions, Transport};
+use crate::session::{Result, Session, SessionError, SessionOptions, Transport};
 
 /// A recording split into the initialize response and per-turn frames.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,13 +45,19 @@ impl Recording {
                 }
                 Some("control_request") => {}
                 // A result with `origin` ends a turn the CLI started itself;
-                // it is replayed in front of the next prompted turn.
-                Some("result") if frame.get("origin").is_none() => {
+                // it is replayed in front of the next prompted turn. Same
+                // rule as the live session: `origin: null` is no origin.
+                Some("result") if frame.get("origin").is_none_or(Value::is_null) => {
                     current.push(line.to_string());
                     turns.push(std::mem::take(&mut current));
                 }
                 _ => current.push(line.to_string()),
             }
+        }
+        // Frames after the last prompted result (a turn the CLI started
+        // itself, late system frames) play after that result.
+        if let Some(last) = turns.last_mut() {
+            last.append(&mut current);
         }
         let initialize_response = initialize_response
             .ok_or_else(|| SessionError::InvalidRecording("no initialize response".into()))?;
@@ -72,11 +78,10 @@ pub async fn replay(path: impl AsRef<Path>, opts: SessionOptions) -> Result<Sess
     let (host, cli) = tokio::io::duplex(1 << 16);
     let (host_out, host_in) = tokio::io::split(host);
     let fake = tokio::spawn(fake_cli(cli, recording));
-    let exit = Box::pin(async move {
-        let code = fake.await.ok().map(|()| 0);
-        ExitInfo { code, stderr: String::new() }
-    });
-    let transport = Transport { stdin: Box::new(host_in), stdout: Box::new(host_out), exit, pgid: None };
+    let exit = Box::pin(async move { fake.await.ok().map(|()| 0) });
+    let stderr_tail = Box::pin(async { String::new() });
+    let transport =
+        Transport { stdin: Box::new(host_in), stdout: Box::new(host_out), exit, stderr_tail, pgid: None };
     Session::connect(transport, opts, Initialize::default(), record).await
 }
 

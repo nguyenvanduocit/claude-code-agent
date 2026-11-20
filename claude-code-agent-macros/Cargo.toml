@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-agent-macros"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Proc macros for claude-code-agent — #[claude_tool] generates ToolDef from async fn signatures"

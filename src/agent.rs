@@ -296,7 +296,7 @@ impl Agent {
 
                 if !started {
                     match msg.as_ref() {
-                        InboundMessage::User(u) if u.uuid.as_deref() == Some(uuid.as_str()) => {
+                        InboundMessage::User(u) if u.uuid.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(&uuid)) => {
                             started = true;
                             for m in held.drain(..) {
                                 for ev in to_events(&m, partial) {

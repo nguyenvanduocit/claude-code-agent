@@ -16,7 +16,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -98,6 +98,12 @@ const STATE_DEAD: u8 = 2;
 const STDERR_TAIL_LINES: usize = 40;
 /// After the CLI exits, how long stderr may still deliver its last lines.
 const STDERR_LINGER: Duration = Duration::from_millis(500);
+/// After the CLI's exit is recorded, how long stdout may stay silent before
+/// the reader stops: a process the CLI started can hold the pipe open.
+const STDOUT_LINGER: Duration = Duration::from_millis(100);
+/// How long tool process groups get between SIGTERM and SIGKILL.
+#[cfg(unix)]
+const GROUP_GRACE: Duration = Duration::from_secs(2);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default of `SessionOptions::control_timeout`.
 pub const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -450,8 +456,10 @@ pub(crate) struct ExitInfo {
 pub(crate) struct Transport {
     pub(crate) stdin: Box<dyn AsyncWrite + Unpin + Send>,
     pub(crate) stdout: Box<dyn AsyncRead + Unpin + Send>,
-    /// Resolves when the CLI has exited.
-    pub(crate) exit: Pin<Box<dyn Future<Output = ExitInfo> + Send>>,
+    /// Resolves with the exit code when the CLI has exited.
+    pub(crate) exit: Pin<Box<dyn Future<Output = Option<i32>> + Send>>,
+    /// Polled after `exit`: the last stderr lines.
+    pub(crate) stderr_tail: Pin<Box<dyn Future<Output = String> + Send>>,
     /// Unix: process group of the CLI and everything it started (Bash
     /// tools, …). Windows: the CLI's pid, root of its process tree.
     pub(crate) pgid: Option<i32>,
@@ -505,6 +513,8 @@ struct SessionInner {
     turns_in_flight: Arc<AtomicUsize>,
     /// `true` once the reader has handled the last stdout line.
     reader_done: watch::Receiver<bool>,
+    /// `close()` has ended the CLI's process group and its tools'.
+    group_ended: AtomicBool,
     _tasks: [JoinHandle<()>; 3],
 }
 
@@ -524,6 +534,8 @@ struct Responder {
     /// Running handlers of CLI control requests, by request id, so a
     /// `control_cancel_request` can stop them.
     in_flight: DashMap<String, tokio::task::AbortHandle>,
+    /// The session's id, for `ToolContext::session_id`.
+    session_id: Arc<RwLock<Option<String>>>,
 }
 
 impl Session {
@@ -535,6 +547,8 @@ impl Session {
     ///   3. wait for its `control_response`
     pub async fn spawn(opts: SessionOptions, init: Initialize) -> Result<Self> {
         let binary = if opts.code_mode {
+            // Patching an old CLI fails on its anchors; name the real cause.
+            check_binary_version(&opts.binary).await?;
             crate::code_mode::patched_binary(&opts.binary).await?
         } else {
             opts.binary.clone()
@@ -623,17 +637,17 @@ impl Session {
         };
         let tail = Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
         let mut drain = tokio::spawn(drain_stderr(stderr, opts.on_stderr.clone(), tail.clone()));
-        let exit = Box::pin(async move {
-            // Exit is the child's, not stderr's EOF: a tool the CLI started
-            // can inherit stderr and hold it open after the CLI is gone.
-            let code = child.wait().await.ok().and_then(|s| s.code());
+        // Exit is the child's, not stderr's EOF: a tool the CLI started can
+        // inherit stderr and hold it open after the CLI is gone.
+        let exit = Box::pin(async move { child.wait().await.ok().and_then(|s| s.code()) });
+        let stderr_tail = Box::pin(async move {
             if tokio::time::timeout(STDERR_LINGER, &mut drain).await.is_err() {
                 drain.abort();
             }
-            let stderr = Vec::from(std::mem::take(&mut *lock(&tail))).join("\n");
-            ExitInfo { code, stderr }
+            Vec::from(std::mem::take(&mut *lock(&tail))).join("\n")
         });
-        let transport = Transport { stdin: Box::new(stdin), stdout: Box::new(stdout), exit, pgid };
+        let transport =
+            Transport { stdin: Box::new(stdin), stdout: Box::new(stdout), exit, stderr_tail, pgid };
         Self::connect(transport, opts, init, record).await
     }
 
@@ -645,7 +659,7 @@ impl Session {
         mut init: Initialize,
         record: Option<tokio::fs::File>,
     ) -> Result<Self> {
-        let Transport { stdin, stdout, exit: exit_fut, pgid } = transport;
+        let Transport { stdin, stdout, exit: exit_fut, stderr_tail, pgid } = transport;
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(256);
         let fanout = Arc::new(std::sync::Mutex::new(Fanout::default()));
         let session_id = Arc::new(RwLock::new(None));
@@ -670,9 +684,10 @@ impl Session {
 
         let state2 = state.clone();
         let watchdog = tokio::spawn(async move {
-            let info = exit_fut.await;
+            let code = exit_fut.await;
             state2.store(STATE_DEAD, Ordering::SeqCst);
-            let _ = exit_tx.send(Some(info));
+            let stderr = stderr_tail.await;
+            let _ = exit_tx.send(Some(ExitInfo { code, stderr }));
         });
 
         let responder = Arc::new(Responder {
@@ -681,12 +696,14 @@ impl Session {
             can_use_tool: opts.can_use_tool.clone(),
             on_elicitation: opts.on_elicitation.clone(),
             on_user_dialog: opts.on_user_dialog.clone(),
-            mcp_servers: opts.mcp_servers.clone(),
+            mcp_servers: opts.mcp_servers.iter().map(SdkMcpServer::for_session).collect(),
             dynamic_mcp_servers: RwLock::new(vec![]),
             in_flight: DashMap::new(),
+            session_id: session_id.clone(),
         });
         let reader = tokio::spawn(read_loop(stdout, Reader {
             record,
+            exit: exit_rx.clone(),
             fanout: fanout.clone(),
             session_id: session_id.clone(),
             pending: pending.clone(),
@@ -711,6 +728,7 @@ impl Session {
             responder,
             turns_in_flight,
             reader_done,
+            group_ended: AtomicBool::new(false),
             _tasks: [reader, writer, watchdog],
         }));
 
@@ -775,13 +793,19 @@ impl Session {
     /// Interrupt the running turn and cancel every queued prompt.
     /// Source: binary interrupt schema (`cancel_queued`)
     pub async fn interrupt_all(&self) -> Result<()> {
-        let reply = self.control(&serde_json::json!({ "subtype": "interrupt", "cancel_queued": true })).await?;
-        // Cancelled prompts get no `result`.
-        let cancelled = reply.get("cancelled").and_then(|c| c.as_array()).map_or(0, Vec::len);
-        for _ in 0..cancelled {
-            decrement(&self.0.turns_in_flight);
-        }
-        Ok(())
+        // In its own task: the count fix-up must run even if the caller
+        // drops this future after the CLI cancelled the prompts.
+        let session = self.clone();
+        detached(async move {
+            let reply = session.control(&serde_json::json!({ "subtype": "interrupt", "cancel_queued": true })).await?;
+            // Cancelled prompts get no `result`.
+            let cancelled = reply.get("cancelled").and_then(|c| c.as_array()).map_or(0, Vec::len);
+            for _ in 0..cancelled {
+                decrement(&session.0.turns_in_flight);
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Switch model for the following turns. `None` clears the override, so
@@ -866,12 +890,22 @@ impl Session {
     /// Source: binary `cancel_async_message` and interrupt
     /// (`for_user_message_uuids`) schemas
     pub async fn cancel_prompt(&self, uuid: &str) -> Result<()> {
-        let dropped = self
-            .control(&serde_json::json!({ "subtype": "cancel_async_message", "message_uuid": uuid }))
-            .await?;
-        if dropped.get("cancelled").and_then(serde_json::Value::as_bool) == Some(true) {
-            // No `result` will come for it.
-            decrement(&self.0.turns_in_flight);
+        // In its own task, as in `interrupt_all`.
+        let session = self.clone();
+        let message_uuid = uuid.to_owned();
+        let dropped = detached(async move {
+            let reply = session
+                .control(&serde_json::json!({ "subtype": "cancel_async_message", "message_uuid": message_uuid }))
+                .await?;
+            let dropped = reply.get("cancelled").and_then(serde_json::Value::as_bool) == Some(true);
+            if dropped {
+                // No `result` will come for it.
+                decrement(&session.0.turns_in_flight);
+            }
+            Ok(dropped)
+        })
+        .await?;
+        if dropped {
             return Ok(());
         }
         self.control(&serde_json::json!({ "subtype": "interrupt", "for_user_message_uuids": [uuid] }))
@@ -922,7 +956,8 @@ impl Session {
         external: serde_json::Map<String, serde_json::Value>,
     ) -> Result<serde_json::Value> {
         let servers = server_map(&sdk, Some(&external));
-        *self.0.responder.dynamic_mcp_servers.write().unwrap_or_else(std::sync::PoisonError::into_inner) = sdk;
+        *self.0.responder.dynamic_mcp_servers.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            sdk.iter().map(SdkMcpServer::for_session).collect();
         self.control(&serde_json::json!({ "subtype": "mcp_set_servers", "servers": servers })).await
     }
 
@@ -1124,11 +1159,12 @@ impl Session {
     /// before the write, so a fast `result` cannot arrive first.
     pub(crate) async fn send_prompt(&self, message: &crate::protocol::UserMessage) -> Result<()> {
         self.0.turns_in_flight.fetch_add(1, Ordering::AcqRel);
-        let sent = self.send(message).await;
-        if sent.is_err() {
-            decrement(&self.0.turns_in_flight);
-        }
-        sent
+        // Uncounts on error and when the caller drops this future before
+        // the prompt is queued (a dropped channel send sends nothing).
+        let mut counted = UnsentTurn(Some(&self.0.turns_in_flight));
+        self.send(message).await?;
+        counted.0 = None;
+        Ok(())
     }
 
     /// Whether the subprocess is still running.
@@ -1138,11 +1174,19 @@ impl Session {
     }
 
     /// End the session: close stdin and give the CLI 5 s to exit, then
-    /// SIGTERM, then SIGKILL its process group. Tools it started (background
-    /// Bash commands keep the CLI alive past stdin EOF) end with it.
+    /// SIGTERM, then SIGKILL its process group. Hooks and Bash tools still
+    /// running (the CLI starts each in a process group of its own) end with
+    /// it: SIGTERM, then SIGKILL after 2 s. A process a hook or tool detached
+    /// that outlived it (`(cmd &)`, `nohup cmd &`) is out of reach.
     /// Returns the CLI's exit code (`None` when it ended by a signal).
     pub async fn close(&self) -> Option<i32> {
+        #[cfg(unix)]
+        let pgid = self.0.pgid;
         let _ = self.0.state.compare_exchange(STATE_RUNNING, STATE_CLOSING, Ordering::SeqCst, Ordering::SeqCst);
+        // Before stdin closes: once the CLI exits, its tools lose the parent
+        // link that finds them.
+        #[cfg(unix)]
+        let mut groups = blocking(move || tool_groups(pgid)).await;
         self.0.stdin_tx.lock().await.take();
         let mut exit = self.wait_exit(CLOSE_GRACE).await;
         #[cfg(unix)]
@@ -1150,12 +1194,22 @@ impl Session {
             if exit.is_some() {
                 break;
             }
+            for group in blocking(move || tool_groups(pgid)).await {
+                if !groups.contains(&group) {
+                    groups.push(group);
+                }
+            }
             self.signal_group(signal);
             exit = self.wait_exit(CLOSE_GRACE).await;
         }
-        // Children the CLI left running share its process group.
+        // The CLI's own group holds the children it left running (MCP
+        // servers, background tasks).
         #[cfg(unix)]
-        self.signal_group(nix::sys::signal::Signal::SIGTERM);
+        {
+            groups.extend(pgid);
+            blocking(move || end_groups(&groups)).await;
+            self.0.group_ended.store(true, Ordering::Release);
+        }
         #[cfg(not(unix))]
         if exit.is_none() {
             kill_tree(self.0.pgid);
@@ -1209,12 +1263,17 @@ impl Session {
             return Err(self.dead_error().await);
         }
         let envelope = OutboundControlRequest { kind: "control_request", request_id: &request_id, request: body };
-        self.send(&envelope).await?;
-
-        let reply = match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(reply)) => reply,
-            // Sender dropped: the reader hit EOF because the process exited.
-            Ok(Err(_)) => return Err(self.dead_error().await),
+        // The write counts against the timeout too: a hung CLI stops
+        // reading stdin, and the pipe fills.
+        let exchange = async {
+            self.send(&envelope).await?;
+            Ok::<_, SessionError>(rx.await)
+        };
+        let reply = match tokio::time::timeout(timeout, exchange).await {
+            Ok(Ok(Ok(reply))) => reply,
+            Ok(Err(e)) => return Err(e),
+            // Sender dropped: the reader ended because the process exited.
+            Ok(Ok(Err(_))) => return Err(self.dead_error().await),
             Err(_) => return Err(SessionError::ControlTimeout(subtype)),
         };
         match reply.subtype.as_str() {
@@ -1252,26 +1311,41 @@ impl Drop for PendingGuard<'_> {
 }
 
 impl Drop for SessionInner {
-    /// Dropping the last handle ends the CLI and the tools it started:
-    /// SIGTERM now, SIGKILL if the CLI is still running after `CLOSE_GRACE`.
-    /// Without a Tokio runtime there is no escalation; `close().await` is
-    /// the complete shutdown.
+    /// Dropping the last handle ends the CLI and what it started, as
+    /// `close()` does: SIGTERM now to the CLI's group and its tools'
+    /// groups, then from a cleanup thread SIGKILL to whatever is left after
+    /// the grace periods. The thread needs no Tokio runtime. The CLI's group
+    /// is signalled even when the CLI already died, for the children it left
+    /// (MCP servers).
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid
-            && self.state.load(Ordering::Acquire) != STATE_DEAD
+            && !self.group_ended.load(Ordering::Acquire)
         {
             use nix::sys::signal::{killpg, Signal};
             let group = nix::unistd::Pid::from_raw(pgid);
-            let _ = killpg(group, Signal::SIGTERM);
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                let mut exit = self.exit.clone();
-                runtime.spawn(async move {
-                    let exited = tokio::time::timeout(CLOSE_GRACE, exit.wait_for(Option::is_some)).await;
-                    if !matches!(exited, Ok(Ok(_))) {
-                        let _ = killpg(group, Signal::SIGKILL);
+            let running = self.state.load(Ordering::Acquire) != STATE_DEAD;
+            // Read before signalling: a dead CLI's tools lose their parent link.
+            let mut groups = if running { tool_groups(Some(pgid)) } else { vec![] };
+            groups.push(pgid);
+            for &g in &groups {
+                let _ = killpg(nix::unistd::Pid::from_raw(g), Signal::SIGTERM);
+            }
+            let exit = self.exit.clone();
+            let cleanup = move || {
+                if running {
+                    let deadline = std::time::Instant::now() + CLOSE_GRACE;
+                    while exit.borrow().is_none()
+                        && killpg(group, None).is_ok()
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
                     }
-                });
+                }
+                end_groups(&groups);
+            };
+            if let Err(e) = std::thread::Builder::new().name("claude-session-cleanup".into()).spawn(cleanup) {
+                tracing::warn!(error = %e, "could not start the session cleanup thread");
             }
         }
         #[cfg(not(unix))]
@@ -1279,6 +1353,82 @@ impl Drop for SessionInner {
             kill_tree(self.pgid);
         }
     }
+}
+
+/// Decrements the in-flight turn count when dropped while still holding it.
+struct UnsentTurn<'a>(Option<&'a AtomicUsize>);
+
+impl Drop for UnsentTurn<'_> {
+    fn drop(&mut self) {
+        if let Some(n) = self.0 {
+            decrement(n);
+        }
+    }
+}
+
+/// Run `work` in its own task, so it completes even when the caller drops
+/// the returned future.
+async fn detached<T: Send + 'static>(work: impl Future<Output = Result<T>> + Send + 'static) -> Result<T> {
+    tokio::spawn(work)
+        .await
+        .unwrap_or_else(|e| Err(SessionError::Io(std::io::Error::other(format!("control task failed: {e}")))))
+}
+
+/// Run blocking `work` off the async threads.
+#[cfg(unix)]
+async fn blocking<T: Default + Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(work).await.unwrap_or_default()
+}
+
+/// Process groups of the hooks and tools the CLI `pgid` leads is running.
+/// Blocking: reads the process table.
+#[cfg(unix)]
+fn tool_groups(pgid: Option<i32>) -> Vec<i32> {
+    let Some(root) = pgid else { return vec![] };
+    let host = nix::unistd::getpgrp().as_raw();
+    crate::process_tree::descendant_groups(&crate::process_tree::snapshot(), root, host)
+}
+
+/// SIGTERM every group, then SIGKILL the ones still there after
+/// `GROUP_GRACE`. Blocking. A group id is not reused while any process
+/// is in the group, so signalling a remembered id reaches either that
+/// group or, once it is empty, nobody (barring a pid wrap-around to that
+/// exact id within the grace period).
+#[cfg(unix)]
+fn end_groups(groups: &[i32]) {
+    use nix::sys::signal::{killpg, Signal};
+    let pid = nix::unistd::Pid::from_raw;
+    for &group in groups {
+        let _ = killpg(pid(group), Signal::SIGTERM);
+    }
+    let still_there = |groups: &[i32]| -> Vec<i32> {
+        groups.iter().copied().filter(|&g| killpg(pid(g), None).is_ok()).collect()
+    };
+    let deadline = std::time::Instant::now() + GROUP_GRACE;
+    let mut left = still_there(groups);
+    while !left.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        left = still_there(&left);
+    }
+    for group in left {
+        let _ = killpg(pid(group), Signal::SIGKILL);
+    }
+}
+
+/// Refuse a CLI older than `MIN_CLI_VERSION` from its `--version` output.
+/// A CLI that cannot answer is let through; the handshake checks again.
+async fn check_binary_version(binary: &std::path::Path) -> Result<()> {
+    let run = Command::new(binary).arg("--version").kill_on_drop(true).output();
+    let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(30), run).await else {
+        return Ok(());
+    };
+    // "2.1.329 (Claude Code)"
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let found = stdout.split_whitespace().next().unwrap_or_default().to_owned();
+    if out.status.success() && !found.is_empty() && version_lt(&found, MIN_CLI_VERSION) {
+        return Err(SessionError::UnsupportedCliVersion { found, min: MIN_CLI_VERSION });
+    }
+    Ok(())
 }
 
 /// Feed every stderr line to `on_stderr` and keep the last ones in `tail`.
@@ -1462,6 +1612,9 @@ fn with_subtype(mut body: serde_json::Value, subtype: &str) -> serde_json::Value
 /// State the reader task shares with the Session.
 struct Reader {
     record: Option<tokio::fs::File>,
+    /// The CLI's recorded exit, after which stdout is read only while data
+    /// keeps coming.
+    exit: watch::Receiver<Option<ExitInfo>>,
     fanout: Arc<std::sync::Mutex<Fanout>>,
     session_id: Arc<RwLock<Option<String>>>,
     pending: Arc<Pending>,
@@ -1471,7 +1624,7 @@ struct Reader {
 }
 
 async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
-    let Reader { record, fanout, session_id, pending, turns_in_flight, responder, done } = reader;
+    let Reader { record, mut exit, fanout, session_id, pending, turns_in_flight, responder, done } = reader;
     // Runs on EOF and on a panic alike, so streams and waiters never hang.
     let cleanup = ReaderCleanup {
         fanout: fanout.clone(),
@@ -1482,7 +1635,27 @@ async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
     };
     let mut record = record.map(BufWriter::new);
     let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut exited = false;
+    loop {
+        // `next_line` is cancel safe: a partly read line stays buffered.
+        let next = if exited {
+            match tokio::time::timeout(STDOUT_LINGER, lines.next_line()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    tracing::debug!("CLI exited but stdout is held open; stopping the reader");
+                    break;
+                }
+            }
+        } else {
+            tokio::select! {
+                next = lines.next_line() => next,
+                _ = exit.wait_for(Option::is_some) => {
+                    exited = true;
+                    continue;
+                }
+            }
+        };
+        let Ok(Some(line)) = next else { break };
         if line.trim().is_empty() {
             continue;
         }
@@ -1684,7 +1857,10 @@ impl Responder {
                     dynamic.iter().find(|s| s.name == m.server_name).cloned()
                 });
                 let reply = match server {
-                    Some(server) => server.handle(&m.message).instrument(span).await,
+                    Some(server) => {
+                        let session_id = self.session_id.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                        server.handle_in_session(&m.message, session_id).instrument(span).await
+                    }
                     None => serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": m.message.get("id"),

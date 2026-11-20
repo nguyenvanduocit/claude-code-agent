@@ -14,6 +14,7 @@
 //!   - a session returned while its turn is still running is not reused;
 //!     it ends once its last handle is dropped (until then it runs outside
 //!     the `max_sessions` count)
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::Semaphore;
@@ -29,6 +30,8 @@ pub struct PoolConfig {
     /// Most sessions checked out at once. Default 4.
     pub max_sessions: usize,
     /// Options every pooled session is spawned with (`cwd`, hooks, …).
+    /// `record` names a pattern: session N records to `<stem>.N.<ext>`
+    /// (`hi.jsonl` → `hi.1.jsonl`, `hi.2.jsonl`, …), one file each.
     pub options: SessionOptions,
 }
 
@@ -72,6 +75,8 @@ struct PoolInner {
     idle: Mutex<Vec<Idle>>,
     semaphore: Arc<Semaphore>,
     config: PoolConfig,
+    /// Sessions spawned so far; numbers their recording files.
+    spawned: AtomicU64,
 }
 
 /// A pool of pre-warmed Claude sessions. Cheap to clone.
@@ -87,6 +92,7 @@ impl SessionPool {
             idle: Mutex::new(Vec::with_capacity(max)),
             semaphore: Arc::new(Semaphore::new(max)),
             config,
+            spawned: AtomicU64::new(0),
         }))
     }
 
@@ -102,7 +108,7 @@ impl SessionPool {
         };
         let tasks: Vec<_> = (0..count)
             .map(|_| {
-                let opts = self.0.config.options.clone();
+                let opts = self.spawn_options(self.0.config.options.clone());
                 tokio::spawn(async move { Session::spawn(opts, Initialize::default()).await })
             })
             .collect();
@@ -156,8 +162,15 @@ impl SessionPool {
             return Ok(PooledSession { session, pool: self.clone(), _permit: permit });
         }
 
-        let session = Session::spawn(options, Initialize::default()).await?;
+        let session = Session::spawn(self.spawn_options(options), Initialize::default()).await?;
         Ok(PooledSession { session, pool: self.clone(), _permit: permit })
+    }
+
+    /// `options` for the next spawned session: its own recording file.
+    fn spawn_options(&self, mut options: SessionOptions) -> SessionOptions {
+        let n = self.0.spawned.fetch_add(1, Ordering::Relaxed) + 1;
+        options.record = options.record.map(|path| numbered(&path, n));
+        options
     }
 
     fn idle(&self) -> MutexGuard<'_, Vec<Idle>> {
@@ -220,4 +233,14 @@ impl Drop for PooledSession {
         }
         // Permit dropped here → semaphore released.
     }
+}
+
+/// `path` with `n` before its extension: `hi.jsonl` → `hi.3.jsonl`.
+fn numbered(path: &std::path::Path, n: u64) -> std::path::PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let name = match path.extension() {
+        Some(ext) => format!("{stem}.{n}.{}", ext.to_string_lossy()),
+        None => format!("{stem}.{n}"),
+    };
+    path.with_file_name(name)
 }

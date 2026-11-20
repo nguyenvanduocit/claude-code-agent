@@ -16,23 +16,33 @@
 //! ```
 //! Register the tool with `SdkMcpServer::new("name").tool(search_files_tool())`.
 //!
-//! Arguments are deserialized with serde (`T: DeserializeOwned`; `&str` / `&T`
-//! are deserialized owned and borrowed). The return value becomes the tool
-//! result: `Result<T, E>` → `T` or an error result with `E: Display`;
+//! Arguments are deserialized with serde (`T: DeserializeOwned`). A top-level
+//! reference is deserialized owned and borrowed: `&str` from `String`, `&[T]`
+//! from `Vec<T>`, `&Path` from `PathBuf` (`<Path as ToOwned>::Owned`), `&T`
+//! from `T`. References nested in another type (`Option<&str>`, `Vec<&str>`),
+//! `&mut T` and `impl Trait` parameters are rejected; use the owned type.
+//!
+//! The return value becomes the tool result, chosen by its type (aliases
+//! included): `Result<T, E>` → `T` or an error result with `E: Display`;
 //! `ToolResult` → passed through; `()` → "ok"; anything else → serde JSON
 //! (strings verbatim).
 //!
-//! Type mapping for the input schema:
+//! Type mapping for the input schema (by the last path segment's name):
 //! ```text
-//! String / &str                  → {"type":"string"}
-//! i8..i128/u8..u128/usize/isize  → {"type":"integer"}
-//! f32/f64                        → {"type":"number"}
-//! bool                           → {"type":"boolean"}
-//! Vec<String>                    → {"type":"array","items":{"type":"string"}}
-//! Vec<_>                         → {"type":"array"}
-//! Option<T>                      → same as T but NOT added to `required`
-//! anything else                  → {"type":"object"}
+//! String / str / char / PathBuf / Path       → {"type":"string"}
+//! i8..i128/u8..u128/usize/isize              → {"type":"integer"}
+//! f32/f64                                    → {"type":"number"}
+//! bool                                       → {"type":"boolean"}
+//! Vec/VecDeque/HashSet/BTreeSet<T>, [T; N], [T]
+//!                                            → {"type":"array","items":<T>}
+//!                                              ("items" omitted when T maps to {})
+//! HashMap / BTreeMap                         → {"type":"object"}
+//! Option<T> (parameter)                      → same as T but NOT added to `required`
+//! Option<T> (nested)                         → {"anyOf":[<T>,{"type":"null"}]}
+//! anything else (serde_json::Value, OsString, user structs and enums)
+//!                                            → {} (any value)
 //! ```
+//! Give a user type a precise schema by building the `ToolDef` by hand.
 #![warn(missing_docs)]
 
 use proc_macro::TokenStream;
@@ -40,8 +50,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::ext::IdentExt;
 use syn::{
-    parse_macro_input, Attribute, FnArg, GenericArgument, ItemFn, Lit, Meta, Pat, PathArguments,
-    ReturnType, Type,
+    parse_macro_input, Attribute, FnArg, GenericArgument, ItemFn, Lit, Meta, Pat, PathArguments, Type,
 };
 
 /// Generate `<fn>_tool_def()` and `<fn>_tool()` for a fn; see the crate docs.
@@ -93,8 +102,8 @@ fn impl_claude_tool(func: &ItemFn) -> syn::Result<TokenStream2> {
         let Pat::Ident(p) = pat_type.pat.as_ref() else {
             return Err(syn::Error::new_spanned(&pat_type.pat, "#[claude_tool] parameters must be plain identifiers"));
         };
+        let (owned, borrowed) = owned_type(&pat_type.ty)?;
         let (optional, schema) = type_to_schema(&pat_type.ty);
-        let (owned, borrowed) = owned_type(&pat_type.ty);
         params.push(Param {
             name: p.ident.unraw().to_string(),
             ident: format_ident!("__arg_{}", p.ident),
@@ -141,23 +150,16 @@ fn impl_claude_tool(func: &ItemFn) -> syn::Result<TokenStream2> {
         quote! { #fn_name(#(#call_args),*) }
     };
 
-    let serialize = quote! {
-        |v| match ::claude_code_agent::__private::serde_json::to_value(v) {
-            ::core::result::Result::Ok(v) => ::claude_code_agent::ToolResult::from_value(v),
-            ::core::result::Result::Err(e) => ::claude_code_agent::ToolResult::error(e.to_string()),
-        }
-    };
-    let convert = match return_kind(&func.sig.output) {
-        ReturnKind::Unit => quote! { { #call; ::claude_code_agent::ToolResult::text("ok") } },
-        ReturnKind::ToolResult => quote! { #call },
-        ReturnKind::Result => quote! {
-            match #call {
-                ::core::result::Result::Ok(v) => (#serialize)(v),
-                ::core::result::Result::Err(e) => ::claude_code_agent::ToolResult::error(e.to_string()),
-            }
-        },
-        ReturnKind::Value => quote! { (#serialize)(#call) },
-    };
+    // The impl picked depends on the returned value's type; see
+    // `claude_code_agent::__private::ret`.
+    let convert = quote! {{
+        #[allow(unused_imports)]
+        use ::claude_code_agent::__private::ret::{
+            ResultKind as _, SerializeKind as _, ToolResultKind as _, UnitKind as _,
+        };
+        let __ret = #call;
+        (&__ret).__claude_tool_kind().convert(__ret)
+    }};
 
     Ok(quote! {
         #func
@@ -183,36 +185,70 @@ fn impl_claude_tool(func: &ItemFn) -> syn::Result<TokenStream2> {
     })
 }
 
-enum ReturnKind {
-    Unit,
-    ToolResult,
-    Result,
-    Value,
-}
-
-fn return_kind(output: &ReturnType) -> ReturnKind {
-    let ReturnType::Type(_, ty) = output else {
-        return ReturnKind::Unit;
-    };
-    match ty.as_ref() {
-        Type::Tuple(t) if t.elems.is_empty() => ReturnKind::Unit,
-        Type::Path(tp) => match tp.path.segments.last().map(|s| s.ident.to_string()).as_deref() {
-            Some("ToolResult") => ReturnKind::ToolResult,
-            Some("Result") => ReturnKind::Result,
-            _ => ReturnKind::Value,
-        },
-        _ => ReturnKind::Value,
-    }
-}
-
 /// Owned type to deserialize a parameter into, and whether to pass it by reference.
-fn owned_type(ty: &Type) -> (TokenStream2, bool) {
+fn owned_type(ty: &Type) -> syn::Result<(TokenStream2, bool)> {
+    let Type::Reference(r) = ty else {
+        reject_unsupported(ty)?;
+        return Ok((quote! { #ty }, false));
+    };
+    if r.mutability.is_some() {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "#[claude_tool] does not support `&mut` parameters; take the owned type (`T` instead of `&mut T`)",
+        ));
+    }
+    let elem = r.elem.as_ref();
+    reject_unsupported(elem)?;
+    let owned = match elem {
+        Type::Path(tp) if tp.path.is_ident("str") => quote! { ::std::string::String },
+        Type::Slice(s) => {
+            let inner = &s.elem;
+            quote! { ::std::vec::Vec<#inner> }
+        }
+        Type::Path(tp) if tp.path.segments.last().is_some_and(|s| s.ident == "Path") => {
+            quote! { <#elem as ::std::borrow::ToOwned>::Owned }
+        }
+        _ => quote! { #elem },
+    };
+    Ok((owned, true))
+}
+
+/// Reject types that cannot be deserialized owned: references (other than a
+/// top-level one, handled by `owned_type`), `impl Trait` and `dyn Trait`.
+fn reject_unsupported(ty: &Type) -> syn::Result<()> {
     match ty {
-        Type::Reference(r) => match r.elem.as_ref() {
-            Type::Path(tp) if tp.path.is_ident("str") => (quote! { ::std::string::String }, true),
-            elem => (quote! { #elem }, true),
-        },
-        other => (quote! { #other }, false),
+        Type::Reference(_) => Err(syn::Error::new_spanned(
+            ty,
+            "#[claude_tool] parameters cannot hold references inside another type; use the owned type \
+             (`Option<String>` instead of `Option<&str>`, `Vec<String>` instead of `Vec<&str>`)",
+        )),
+        Type::ImplTrait(_) => Err(syn::Error::new_spanned(
+            ty,
+            "#[claude_tool] does not support `impl Trait` parameters; use a concrete owned type \
+             (`String` instead of `impl Into<String>`)",
+        )),
+        Type::TraitObject(_) => Err(syn::Error::new_spanned(
+            ty,
+            "#[claude_tool] parameters cannot be trait objects; use a concrete owned type",
+        )),
+        Type::Path(tp) => {
+            for seg in &tp.path.segments {
+                if let PathArguments::AngleBracketed(ab) = &seg.arguments {
+                    for arg in &ab.args {
+                        if let GenericArgument::Type(t) = arg {
+                            reject_unsupported(t)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Type::Tuple(t) => t.elems.iter().try_for_each(reject_unsupported),
+        Type::Array(a) => reject_unsupported(&a.elem),
+        Type::Slice(s) => reject_unsupported(&s.elem),
+        Type::Paren(p) => reject_unsupported(&p.elem),
+        Type::Group(g) => reject_unsupported(&g.elem),
+        _ => Ok(()),
     }
 }
 
@@ -231,49 +267,65 @@ fn extract_doc(attrs: &[Attribute]) -> String {
     lines.join(" ")
 }
 
-/// Returns `(is_optional, json_schema_tokens)`.
+/// Returns `(is_optional, json_schema_tokens)` for a parameter type.
 fn type_to_schema(ty: &Type) -> (bool, TokenStream2) {
+    let (optional, schema) = match option_inner(ty) {
+        Some(inner) => (true, inner.and_then(schema)),
+        None => (false, schema(ty)),
+    };
+    (optional, schema.unwrap_or_else(|| quote! { {} }))
+}
+
+/// `Some(first type argument)` if `ty` is `Option<_>`.
+fn option_inner(ty: &Type) -> Option<Option<&Type>> {
+    let Type::Path(tp) = ty else { return None };
+    let last = tp.path.segments.last()?;
+    (last.ident == "Option").then(|| first_type_arg(last))
+}
+
+fn first_type_arg(seg: &syn::PathSegment) -> Option<&Type> {
+    let PathArguments::AngleBracketed(ab) = &seg.arguments else { return None };
+    ab.args.iter().find_map(|a| match a {
+        GenericArgument::Type(t) => Some(t),
+        _ => None,
+    })
+}
+
+/// JSON schema for a type; `None` means no constraint (`{}`), which is never
+/// wrong, unlike a guessed type the model would then follow.
+fn schema(ty: &Type) -> Option<TokenStream2> {
     match ty {
+        Type::Reference(r) => schema(&r.elem),
+        Type::Paren(p) => schema(&p.elem),
+        Type::Group(g) => schema(&g.elem),
+        Type::Slice(s) => Some(array_schema(schema(&s.elem))),
+        Type::Array(a) => Some(array_schema(schema(&a.elem))),
         Type::Path(tp) => {
-            let Some(last) = tp.path.segments.last() else {
-                return (false, quote! { {"type": "object"} });
-            };
-            let name = last.ident.to_string();
-
-            // Option<T> → unwrap inner, mark optional
-            if name == "Option" {
-                if let PathArguments::AngleBracketed(ab) = &last.arguments
-                    && let Some(GenericArgument::Type(inner)) = ab.args.first()
-                {
-                    let (_, inner_schema) = type_to_schema(inner);
-                    return (true, inner_schema);
-                }
-                return (true, quote! { {"type": "object"} });
-            }
-
-            // Vec<T>
-            if name == "Vec" {
-                if let PathArguments::AngleBracketed(ab) = &last.arguments
-                    && let Some(GenericArgument::Type(Type::Path(itp))) = ab.args.first()
-                    && let Some(iseg) = itp.path.segments.last()
-                    && (iseg.ident == "String" || iseg.ident == "str")
-                {
-                    return (false, quote! { {"type": "array", "items": {"type": "string"}} });
-                }
-                return (false, quote! { {"type": "array"} });
-            }
-
-            let schema = match name.as_str() {
-                "String" | "str" => quote! { {"type": "string"} },
-                "bool" => quote! { {"type": "boolean"} },
+            let last = tp.path.segments.last()?;
+            match last.ident.to_string().as_str() {
+                "String" | "str" | "char" | "PathBuf" | "Path" => Some(quote! { {"type": "string"} }),
+                "bool" => Some(quote! { {"type": "boolean"} }),
                 "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => quote! { {"type": "integer"} },
-                "f32" | "f64" => quote! { {"type": "number"} },
-                _ => quote! { {"type": "object"} },
-            };
-            (false, schema)
+                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => Some(quote! { {"type": "integer"} }),
+                "f32" | "f64" => Some(quote! { {"type": "number"} }),
+                "Vec" | "VecDeque" | "HashSet" | "BTreeSet" => {
+                    Some(array_schema(first_type_arg(last).and_then(schema)))
+                }
+                "HashMap" | "BTreeMap" => Some(quote! { {"type": "object"} }),
+                "Option" => {
+                    let inner = first_type_arg(last).and_then(schema)?;
+                    Some(quote! { {"anyOf": [#inner, {"type": "null"}]} })
+                }
+                _ => None,
+            }
         }
-        Type::Reference(tr) => type_to_schema(&tr.elem),
-        _ => (false, quote! { {"type": "object"} }),
+        _ => None,
+    }
+}
+
+fn array_schema(items: Option<TokenStream2>) -> TokenStream2 {
+    match items {
+        Some(items) => quote! { {"type": "array", "items": #items} },
+        None => quote! { {"type": "array"} },
     }
 }

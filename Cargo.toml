@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-agent"
-version = "0.7.0"
+version = "0.7.1"
 rust-version = "1.88"
 edition = "2024"
 description = "Rust SDK for Claude Code — persistent subprocess, hook callbacks, in-process tools, record/replay"
@@ -26,7 +26,7 @@ thiserror    = "2"
 tracing      = "0.1"
 dashmap      = "6"
 
-claude-code-agent-macros      = { version = "0.7.0", path = "claude-code-agent-macros", optional = true }
+claude-code-agent-macros      = { version = "0.7.1", path = "claude-code-agent-macros", optional = true }
 
 tokio-stream = "0.1.19"
 async-stream = "0.3.6"
@@ -34,13 +34,13 @@ uuid = { version = "1", features = ["v4"] }
 regex = { version = "1.13.2", default-features = false, features = ["std", "perf", "unicode-perl"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.32.0", features = ["signal"] }
+nix = { version = "0.32.0", features = ["signal", "user"] }
 
 [dev-dependencies]
 tokio             = { version = "1", features = ["full"] }
 anyhow            = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-claude-code-agent-macros = { version = "0.7.0", path = "claude-code-agent-macros" }
+claude-code-agent-macros = { version = "0.7.1", path = "claude-code-agent-macros" }
 
 [[example]]
 name = "tools"
@@ -48,5 +48,5 @@ required-features = ["macros"]
 
 # Runs its own executable as a fake CLI, so it needs its own `main`.
 [[test]]
-name = "process_tree"
+name = "fake_cli"
 harness = false

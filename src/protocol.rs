@@ -626,8 +626,13 @@ impl HookOutput {
         Self { decision: Some(HookDecision::Block), reason: Some(reason.into()), ..Self::default() }
     }
 
-    /// Inject `additionalContext` for the given event.
+    /// Inject `additionalContext` for the given event. Only events where
+    /// `HookEventKind::accepts_additional_context` holds carry it; for any
+    /// other the CLI rejects the output, so this logs a warning.
     pub fn with_context(event: HookEventKind, context: impl Into<String>) -> Self {
+        if !event.accepts_additional_context() {
+            tracing::warn!(?event, "the CLI ignores additionalContext for this hook event");
+        }
         Self {
             hook_specific_output: Some(serde_json::json!({
                 "hookEventName": event,
@@ -1591,5 +1596,30 @@ pub enum HookEventKind {
     DirectoryAdded,
     /// While assistant message text is displayed.
     MessageDisplay,
+}
+
+impl HookEventKind {
+    /// Whether the CLI reads `hookSpecificOutput.additionalContext` for
+    /// this event (`HookOutput::with_context`).
+    /// Source: CLI hook output schema (chunk-g4jweshk.js:10682-10753)
+    #[must_use]
+    pub fn accepts_additional_context(self) -> bool {
+        matches!(
+            self,
+            Self::PreToolUse
+                | Self::PostToolUse
+                | Self::PostToolUseFailure
+                | Self::PostToolBatch
+                | Self::UserPromptSubmit
+                | Self::UserPromptExpansion
+                | Self::SessionStart
+                | Self::Setup
+                | Self::PostModelSwitch
+                | Self::SubagentStart
+                | Self::Stop
+                | Self::SubagentStop
+                | Self::Notification
+        )
+    }
 }
 
