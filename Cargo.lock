@@ -132,7 +132,9 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "claude-sdk"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
+ "claude-sdk-macros",
  "dashmap",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -145,6 +147,15 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-opentelemetry",
+]
+
+[[package]]
+name = "claude-sdk-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

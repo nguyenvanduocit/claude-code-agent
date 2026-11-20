@@ -19,7 +19,7 @@ tracing      = "0.1"
 dashmap      = "5"
 tokio-util   = { version = "0.7", features = ["codec"] }
 
-claude-sdk-macros      = { path = "claude-sdk-macros", optional = true }
+claude-sdk-macros      = { version = "0.1.0", path = "claude-sdk-macros", optional = true }
 
 opentelemetry          = { version = "0.22", optional = true }
 opentelemetry-otlp     = { version = "0.15", optional = true }
@@ -31,4 +31,4 @@ async-stream = "0.3.6"
 tokio-test        = "0.4"
 tokio-stream      = "0.1.19"
 anyhow            = "1"
-claude-sdk-macros = { path = "claude-sdk-macros" }
+claude-sdk-macros = { version = "0.1.0", path = "claude-sdk-macros" }

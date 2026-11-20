@@ -261,11 +261,16 @@ impl Session {
 
         let session = Session(inner);
 
+        // Subscribe BEFORE sending initialize — avoids a race where the CLI
+        // sends system/init before we subscribe to the broadcast channel.
+        // (--await-initialize blocks Claude until initialize arrives, but once
+        //  it does, the response can fire before we call subscribe().)
+        let mut rx = session.subscribe();
+
         // Send initialize.
         session.send(&init).await?;
 
         // Wait for first system/init frame.
-        let mut rx = session.subscribe();
         loop {
             match rx.recv().await {
                 Ok(msg) => {
