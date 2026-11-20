@@ -6,7 +6,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
 
 use crate::protocol::{AssistantBlock, BackgroundTask, InboundMessage, ResultMessage, UserMessage};
 use crate::session::{Session, SessionError};
@@ -31,8 +30,6 @@ pub enum AgentEvent {
     Done(TurnResult),
     /// Turn failed.
     Error(String),
-    /// Event broadcast lagged — some events were dropped.
-    StreamLag { dropped: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -84,22 +81,26 @@ impl Agent {
         &self.session
     }
 
-    /// Run a prompt and return a streaming iterator of AgentEvents.
+    /// Run a text prompt and return a streaming iterator of AgentEvents.
     ///
     /// The stream ends after a `Done` or `Error` event.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<AgentStream, AgentError> {
+        self.prompt_message(UserMessage::text(text.into())).await
+    }
+
+    /// Run a prompt built from content blocks (text, images, …).
+    pub async fn prompt_message(&self, message: UserMessage) -> Result<AgentStream, AgentError> {
         // Subscribe before sending so no frame of this turn is missed.
         let mut rx = self.session.subscribe();
-        let message = UserMessage::text(text.into());
         let uuid = message.uuid.clone();
-        self.session.send(&message).await?;
+        self.session.send_prompt(&message).await?;
         // With partial messages on, text already streamed as deltas; the
         // complete assistant message would repeat it.
         let partial = self.session.include_partial();
         // Lives as long as the stream: its duration is the turn's duration.
         let span = tracing::info_span!(
             "claude.turn",
-            session_id = self.session.session_id().unwrap_or(""),
+            session_id = self.session.session_id().unwrap_or_default(),
             cost_usd = tracing::field::Empty,
             input_tokens = tracing::field::Empty,
             output_tokens = tracing::field::Empty,
@@ -107,7 +108,11 @@ impl Agent {
             error = tracing::field::Empty,
         );
 
+        // The stream keeps the session alive until its turn ends, even when
+        // the Agent and every other handle are dropped first.
+        let session = self.session.clone();
         let stream = async_stream::stream! {
+            let _session = session;
             // Turns run one after another and each ends with a `result`. Our
             // prompt's echo falls inside our turn: first for a normal prompt,
             // last for a slash command (after e.g. compact_boundary). So frames
@@ -117,16 +122,9 @@ impl Agent {
             let mut started = false;
             let mut held: Vec<Arc<InboundMessage>> = vec![];
             loop {
-                let msg = match rx.recv().await {
-                    Ok(m) => m,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        yield AgentEvent::StreamLag { dropped: n };
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        yield AgentEvent::Error("session closed before the turn finished".into());
-                        break;
-                    }
+                let Some(msg) = rx.recv().await else {
+                    yield AgentEvent::Error("session closed before the turn finished".into());
+                    break;
                 };
 
                 if !started {
@@ -169,9 +167,11 @@ impl Agent {
 
 /// The AgentEvents one frame of the prompt's own turn produces.
 /// `partial`: text arrives as stream deltas, so complete assistant text is skipped.
+/// Frames of subagents (`parent_tool_use_id` set) belong to the subagent, not
+/// to this stream.
 fn to_events(msg: &InboundMessage, partial: bool) -> Vec<AgentEvent> {
     match msg {
-        InboundMessage::Assistant(a) => a
+        InboundMessage::Assistant(a) if a.parent_tool_use_id.is_none() => a
             .message
             .content
             .iter()
@@ -230,7 +230,7 @@ fn to_events(msg: &InboundMessage, partial: bool) -> Vec<AgentEvent> {
 
         InboundMessage::Result(r) if r.is_success() => vec![AgentEvent::Done(TurnResult::from(r))],
         InboundMessage::Result(r) => {
-            vec![AgentEvent::Error(r.error.clone().unwrap_or_else(|| r.subtype.clone()))]
+            vec![AgentEvent::Error(r.error_message())]
         }
 
         _ => vec![],

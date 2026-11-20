@@ -1,8 +1,9 @@
 [package]
 name = "claude-sdk"
-version = "0.1.0"
-edition = "2021"
-description = "Full-protocol Rust SDK for Claude Code — persistent subprocess, 33 hooks, Code Mode, Workflow"
+version = "0.2.0"
+rust-version = "1.88"
+edition = "2024"
+description = "Rust SDK for Claude Code — persistent subprocess, hook callbacks, in-process tools, record/replay"
 license = "MIT"
 
 [features]
@@ -10,21 +11,29 @@ default = []
 macros  = ["dep:claude-sdk-macros"]
 
 [dependencies]
-tokio        = { version = "1", features = ["full"] }
+tokio        = { version = "1", features = ["rt", "process", "io-util", "sync", "time", "fs"] }
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
-thiserror    = "1"
+thiserror    = "2"
 tracing      = "0.1"
-dashmap      = "5"
+dashmap      = "6"
 
-claude-sdk-macros      = { version = "0.1.0", path = "claude-sdk-macros", optional = true }
+claude-sdk-macros      = { version = "0.2.0", path = "claude-sdk-macros", optional = true }
 
 tokio-stream = "0.1.19"
 async-stream = "0.3.6"
 uuid = { version = "1.29.3", features = ["v4"] }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.32.0", features = ["signal"] }
+
 [dev-dependencies]
-tokio-test        = "0.4"
+tokio             = { version = "1", features = ["full"] }
 tokio-stream      = "0.1.19"
 anyhow            = "1"
-claude-sdk-macros = { version = "0.1.0", path = "claude-sdk-macros" }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+claude-sdk-macros = { version = "0.2.0", path = "claude-sdk-macros" }
+
+[[example]]
+name = "tools"
+required-features = ["macros"]

@@ -1,18 +1,9 @@
 //! **claude-sdk** — Full-protocol Rust SDK for Claude Code.
 //!
-//! # What makes this different
-//!
-//! | Feature | Community SDKs | claude-sdk |
-//! |---|---|---|
-//! | Process lifecycle | spawn → result → kill | Persistent subprocess, one process per session |
-//! | Hook coverage | 4–6 events | All 33 hook types with deadline enforcement |
-//! | Streaming | None / fake | Real `stream_event` chunks via `--include-partial-messages` |
-//! | Hook type | Shell commands only | Async Rust closures via `hook_callback` IPC |
-//! | Tool permission | None | `SessionOptions::can_use_tool` async handler |
-//! | Session pool | None | N pre-warmed processes, auto-reuse, auto-respawn |
-//! | Code Mode | None | `SessionOptions::code_mode = true` |
-//! | Reconnect | None | `Session::reconnect(previous_id, ...)` |
-//! | Cost tracking | None | `TurnResult::total_cost_usd`, `ttft_ms`, `duration_ms` |
+//! Drives the `claude` CLI (verified against 2.1.328) over its stream-json
+//! control protocol: one persistent process per session, Rust closures as
+//! hook callbacks and permission handlers, in-process tools over the SDK MCP
+//! bridge, record/replay, and a session pool.
 //!
 //! # Quick start
 //!
@@ -93,7 +84,7 @@
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let pool = SessionPool::new(PoolConfig { max_sessions: 4, ..Default::default() });
-//!     pool.warm(2, ".").await; // pre-warm 2 processes
+//!     pool.warm(2).await; // pre-warm 2 processes
 //!
 //!     // Parallel prompts — each reuses an idle session from the pool
 //!     let (r1, r2) = tokio::join!(
@@ -104,7 +95,7 @@
 //! }
 //!
 //! async fn run_prompt(pool: &SessionPool, text: &str) -> anyhow::Result<String> {
-//!     let borrowed = pool.acquire(".").await?;
+//!     let borrowed = pool.acquire().await?;
 //!     let agent = Agent::new(borrowed.session.clone());
 //!     let mut stream = agent.prompt(text).await?;
 //!     let mut out = String::new();
@@ -115,6 +106,9 @@
 //!     Ok(out)
 //! }
 //! ```
+
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod agent;
 pub mod background;

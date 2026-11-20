@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use claude_sdk::protocol::{HookEventKind, HookOutput, ToolDecision};
+use claude_sdk::protocol::{HookEventKind, HookOutput, PermissionMode, ToolDecision};
 use claude_sdk::{
     Agent, AgentEvent, CanUseTool, HookRegistry, Initialize, SdkMcpServer, Session, SessionOptions,
     TurnResult,
@@ -70,7 +70,7 @@ async fn hook_and_permission_callbacks_gate_tools() {
 
     let opts = SessionOptions {
         cwd: Some(dir.clone()),
-        permission_mode: Some("default".into()),
+        permission_mode: Some(PermissionMode::Default),
         hooks,
         can_use_tool: Some(can_use_tool),
         ..Default::default()
@@ -271,4 +271,49 @@ async fn concurrent_prompts_get_their_own_turns() {
     eprintln!("t1={t1:?} t2={t2:?}");
     assert!(t1.contains("alpha") && !t1.contains("bravo"), "stream 1: {t1:?}");
     assert!(t2.contains("bravo") && !t2.contains("alpha"), "stream 2: {t2:?}");
+}
+
+/// A background Bash task keeps the CLI alive after stdin closes; close() must
+/// still end the CLI and the task's processes (they share its process group).
+#[tokio::test]
+#[ignore = "requires a real claude binary and valid credentials"]
+async fn close_ends_cli_and_background_children() {
+    let secs = 400 + std::process::id() % 100;
+    let session = Session::spawn(SessionOptions::default(), Initialize::default()).await.expect("spawn");
+    let agent = Agent::new(session.clone());
+    let prompt = format!("Run `sleep {secs}` with the Bash tool using run_in_background: true, then reply only: started");
+    let _ = turn(&agent, &prompt).await;
+    let sleepers = || {
+        let out = std::process::Command::new("pgrep").args(["-f", &format!("sleep {secs}")]).output().expect("pgrep");
+        String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_owned).collect::<Vec<_>>()
+    };
+    assert!(!sleepers().is_empty(), "background sleep never started");
+
+    let started = std::time::Instant::now();
+    let code = session.close().await;
+    eprintln!("close took {:?}, exit={code:?}", started.elapsed());
+    assert!(!session.is_alive(), "CLI still alive after close");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(sleepers().is_empty(), "background children survived: {:?}", sleepers());
+}
+
+/// A failed API call arrives as `subtype:"success", is_error:true`; the
+/// stream must end with Error carrying the CLI's message, not Done.
+#[tokio::test]
+#[ignore = "requires a real claude binary"]
+async fn api_error_ends_turn_with_error() {
+    let opts = SessionOptions { model: Some("claude-nonexistent-9".into()), ..Default::default() };
+    let session = Session::spawn(opts, Initialize::default()).await.expect("spawn");
+    let mut stream = Agent::new(session).prompt("hi").await.expect("send");
+    let mut outcome = None;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            AgentEvent::Done(_) => outcome = Some(Err("Done".to_string())),
+            AgentEvent::Error(e) => outcome = Some(Ok(e)),
+            _ => {}
+        }
+    }
+    let message = outcome.expect("no result").expect("turn reported Done");
+    eprintln!("error={message:?}");
+    assert!(message.contains("claude-nonexistent-9"), "{message}");
 }

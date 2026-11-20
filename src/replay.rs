@@ -74,7 +74,7 @@ pub async fn replay(path: impl AsRef<Path>, opts: SessionOptions) -> Result<Sess
         let code = fake.await.ok().map(|_| 0);
         ExitInfo { code, stderr: String::new() }
     });
-    let transport = Transport { stdin: Box::new(host_in), stdout: Box::new(host_out), exit };
+    let transport = Transport { stdin: Box::new(host_in), stdout: Box::new(host_out), exit, pgid: None };
     Session::connect(transport, opts, Initialize::default()).await
 }
 

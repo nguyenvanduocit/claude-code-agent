@@ -19,22 +19,14 @@ Source: `chunk-f89nsf5q.query.js:614, 915–949`
 claude --output-format stream-json \
        --verbose \
        --input-format stream-json \
-       --await-initialize
+       --await-initialize \
+       --replay-user-messages
 ```
 
 - One long-lived process per session. Stdin/stdout are newline-delimited JSON.
-- Send a query by writing `{"type":"user","message":{"role":"user","content":[...]}}` + `\n`.
-- Read response lines until a `result/*` frame arrives.
-- End by calling `.processStdin.end()` — do NOT kill the process mid-turn.
-- `--await-initialize` makes the subprocess emit `{"type":"system","subtype":"init"}` before accepting queries.
-
-```rust
-pub struct Session {
-    child:  Child,
-    stdin:  BufWriter<ChildStdin>,
-    stdout: Lines<BufReader<ChildStdout>>,
-}
-```
+- Send a query by writing `{"type":"user","message":{"role":"user","content":[...]},"uuid":"…"}` + `\n`; the `uuid` marks the turn (see Turn boundaries).
+- `--await-initialize` makes the CLI wait for the `initialize` control request before anything else.
+- `Session` is `Arc<SessionInner>` with three tasks: writer (stdin), reader (stdout → subscribers, answers control requests), watchdog (exit + stderr tail). See Lifecycle.
 
 ---
 
@@ -47,9 +39,9 @@ Source: `chunk-20bv8pca.js` (Zod schema file, 20 000+ lines)
 | Type | Schema location | Description |
 |---|---|---|
 | `initialize` | line 17716–17891 `qfo` | Session init; 30+ fields |
-| `user_message` | — | A turn prompt |
-| `hook_callback` control | line 19959–19979 | Approve/deny/modify hook event |
-| `can_use_tool` control response | — | Approve/deny a tool call |
+| `user` | — | A turn prompt (`message`, `uuid`, `parent_tool_use_id`) |
+| `control_response` to `hook_callback` | line 19959–19979 | Hook output (approve/block/context) |
+| `control_response` to `can_use_tool` | — | Allow (with `updatedInput`) or deny a tool call |
 | `background_tasks` control | line 20970–20995 | Programmatically background an agent |
 
 ### Inbound (CLI → host)
@@ -116,7 +108,7 @@ Source: `chunk-0f728242.js:432–448`
 | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` / `PostToolBatch` | 15 s |
 | `UserPromptSubmit` / `UserPromptExpansion` | 30 s |
 | `Stop` / `StopFailure` / `SubagentStop` | 120 s |
-| All others | default 5 s |
+| All others | not listed in that source |
 
 ### Hook Callback IPC (HIGH)
 
@@ -138,7 +130,10 @@ Lease: 300 s. Response: `status`, `lease_s`, `lease_expires_at`, `accepted`, `ig
 
 ---
 
-## Code Mode (HIGH env var, MEDIUM tool detection)
+## Code Mode (not available on the stock binary)
+
+Verified 2026-11-20: stock 2.1.328 gates Code Mode behind an internal check
+(`ce() && Ba()`); the env var below alone changes nothing. Kept for patched builds.
 
 Source:
 - `chunk-0jv1f6sm.codeModeShape.js:13–15` — env vars
@@ -176,15 +171,7 @@ Source: `chunk-20bv8pca.js:16351–16369` (`M6` schema, `background_tasks_change
 
 **Workflow task type**: `task_type: "local_workflow"` in `background_tasks_changed` events (`chunk-20bv8pca.js:16307–16311`). `workflow_name` carries `meta.name` from the workflow script.
 
-```rust
-pub struct BackgroundTask {
-    pub id: String,
-    pub parent_task_id: Option<String>,
-    pub task_type: TaskType,  // "local_workflow" | "agent" | ...
-    pub status: TaskStatus,
-    pub description: Option<String>,
-}
-```
+`protocol::BackgroundTask` fields: `task_id`, `run_id`, `task_type` (e.g. `"local_bash"`, `"local_workflow"`), `subagent_type`, `description`, `parent_task_id`, `ambient`, `awaited`, `off_host`. `background::TaskTree` builds the tree from `parent_task_id`.
 
 ---
 
@@ -261,10 +248,20 @@ background task finished) and the held frames are dropped.
 
 ## Lifecycle
 
-The Session owns the only strong stdin sender and the reader task owns the only strong
-event sender. `close()` (or dropping the last Session clone) closes stdin, so the CLI
-exits; `close()` waits for the exit and returns the code. When the CLI's stdout ends,
-the event channel closes and in-flight streams end with `Error`.
+The CLI runs in its own process group (`process_group(0)`), so tools it starts (Bash,
+background tasks) are in that group too. The Session owns the only strong stdin
+sender. `close()` closes stdin and waits up to 5 s for the CLI to exit; a CLI kept
+alive by background tasks then gets SIGTERM, then SIGKILL, sent to the whole group,
+and a final SIGTERM to the group ends leftover children. Dropping the last Session
+clone sends SIGTERM to the group if the CLI is still running.
+
+## Event fanout
+
+The reader task sends each frame to every subscriber through its own unbounded
+channel. No frame is dropped for a slow consumer: a lost echo or `result` would hang
+the turn. When stdout ends, all subscriber channels close and in-flight streams end
+with `Error`. Assistant frames with `parent_tool_use_id` belong to a subagent and are
+not turned into the parent turn's `AgentEvent`s.
 
 ---
 

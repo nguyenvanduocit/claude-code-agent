@@ -1,46 +1,50 @@
-/// Session pool — N pre-warmed persistent processes.
+/// Session pool — pre-warmed persistent processes with idle reuse.
 ///
-/// Design from Fork C:
-///   - Bounded concurrency via semaphore
-///   - Idle session reuse — no spawn overhead on reuse
-///   - Auto-respawn on process death
-///   - PooledSession returns to pool on Drop
-///
-/// Source: Fork C internal architecture design; chunk-f89nsf5q.query.js
-use std::sync::Arc;
+///   - at most `max_sessions` sessions are checked out at once (semaphore)
+///   - every session uses `PoolConfig::options` (hooks, MCP servers, model, …)
+///   - a returned session is reset with `/clear` before it is handed out
+///     again, so one task never sees another task's conversation
+///   - dead sessions are dropped and replaced by a fresh spawn
+///   - a session returned while its turn is still running is not reused;
+///     it ends once its last handle is dropped (until then it runs outside
+///     the `max_sessions` count)
+///   - model and permission mode changed with `set_model` /
+///     `set_permission_mode` stay with the session across reuse
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
+use tokio_stream::StreamExt;
 
+use crate::agent::{Agent, AgentEvent};
 use crate::protocol::Initialize;
 use crate::session::{Result, Session, SessionError, SessionOptions};
 
+#[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub max_sessions: usize,
-    pub binary: String,
-    pub code_mode: bool,
-    pub tool_search: bool,
-    pub include_partial: bool,
+    /// Options every pooled session is spawned with (`cwd`, hooks, …).
+    pub options: SessionOptions,
 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self {
-            max_sessions: 4,
-            binary: "claude".into(),
-            code_mode: false,
-            tool_search: false,
-            include_partial: false,
-        }
+        Self { max_sessions: 4, options: SessionOptions::default() }
     }
 }
 
+struct Idle {
+    session: Session,
+    /// Holds a previous task's conversation; needs `/clear` before reuse.
+    used: bool,
+}
+
 struct PoolInner {
-    idle: Mutex<Vec<Session>>,
+    idle: Mutex<Vec<Idle>>,
     semaphore: Arc<Semaphore>,
     config: PoolConfig,
 }
 
-/// A pool of pre-warmed Claude sessions.
+/// A pool of pre-warmed Claude sessions. Cheap to clone.
 #[derive(Clone)]
 pub struct SessionPool(Arc<PoolInner>);
 
@@ -54,74 +58,88 @@ impl SessionPool {
         }))
     }
 
-    /// Pre-warm N sessions in parallel.
-    pub async fn warm(&self, n: usize, cwd: impl Into<String>) -> usize {
-        let cwd = cwd.into();
-        let mut tasks = Vec::with_capacity(n);
-        for _ in 0..n {
-            let pool = self.clone();
-            let cwd = cwd.clone();
-            tasks.push(tokio::spawn(async move {
-                let opts = pool.0.config.make_opts(&cwd);
-                Session::spawn(opts, Initialize::default()).await.ok()
-            }));
-        }
-        let mut warmed = 0usize;
+    /// Spawn up to `n` idle sessions in parallel, within `max_sessions`
+    /// idle plus checked-out sessions. Returns how many were added.
+    pub async fn warm(&self, n: usize) -> usize {
+        let room = self.0.semaphore.available_permits().saturating_sub(self.idle().len());
+        let count = n.min(room);
+        // Held while spawning, so a concurrent acquire() cannot spawn past the limit.
+        let Ok(_permits) = Arc::clone(&self.0.semaphore).try_acquire_many_owned(count as u32) else {
+            return 0;
+        };
+        let tasks: Vec<_> = (0..count)
+            .map(|_| {
+                let opts = self.0.config.options.clone();
+                tokio::spawn(async move { Session::spawn(opts, Initialize::default()).await })
+            })
+            .collect();
+        let mut warmed = 0;
         for t in tasks {
-            if let Ok(Some(s)) = t.await {
-                self.0.idle.lock().await.push(s);
-                warmed += 1;
+            match t.await {
+                Ok(Ok(session)) => {
+                    self.idle().push(Idle { session, used: false });
+                    warmed += 1;
+                }
+                Ok(Err(e)) => tracing::warn!(error = %e, "pool warm-up spawn failed"),
+                Err(e) => tracing::warn!(error = %e, "pool warm-up task failed"),
             }
         }
         warmed
     }
 
-    /// Acquire a session from the pool (waits until one is available).
-    /// Spawns a new process when no idle session is alive.
-    pub async fn acquire(&self, cwd: impl Into<String>) -> Result<PooledSession> {
-        let cwd = cwd.into();
+    /// Check out a session with an empty conversation; waits while
+    /// `max_sessions` are checked out.
+    pub async fn acquire(&self) -> Result<PooledSession> {
         let permit = Arc::clone(&self.0.semaphore)
             .acquire_owned()
             .await
             .map_err(|_| SessionError::Closed)?;
 
-        // Try to reuse an idle session.
-        let session = {
-            let mut idle = self.0.idle.lock().await;
-            idle.pop().filter(|s| s.is_alive())
-        };
-
-        let session = match session {
-            Some(s) => s,
-            None => {
-                // Spawn a new session.
-                let opts = self.0.config.make_opts(&cwd);
-                Session::spawn(opts, Initialize::default()).await?
+        loop {
+            let next = self.idle().pop();
+            let Some(Idle { session, used }) = next else { break };
+            if !session.is_alive() {
+                continue;
             }
-        };
-
-        Ok(PooledSession {
-            session,
-            pool: self.clone(),
-            _permit: permit,
-        })
-    }
-}
-
-impl PoolConfig {
-    fn make_opts(&self, cwd: &str) -> SessionOptions {
-        SessionOptions {
-            binary: self.binary.clone().into(),
-            cwd: Some(cwd.into()),
-            code_mode: self.code_mode,
-            tool_search: self.tool_search,
-            include_partial: self.include_partial,
-            ..Default::default()
+            if used && clear(&session).await.is_err() {
+                session.close().await;
+                continue;
+            }
+            return Ok(PooledSession { session, pool: self.clone(), _permit: permit });
         }
+
+        let session = Session::spawn(self.0.config.options.clone(), Initialize::default()).await?;
+        Ok(PooledSession { session, pool: self.clone(), _permit: permit })
+    }
+
+    fn idle(&self) -> MutexGuard<'_, Vec<Idle>> {
+        self.0.idle.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// A session borrowed from the pool. Returns automatically on Drop.
+/// `/clear` makes no API call; anything slower means a stuck CLI.
+const CLEAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reset the conversation: `/clear` runs locally in the CLI (no API call)
+/// and starts a new session id.
+async fn clear(session: &Session) -> std::result::Result<(), String> {
+    let run = async {
+        let mut stream = Agent::new(session.clone()).prompt("/clear").await.map_err(|e| e.to_string())?;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Done(_) => return Ok(()),
+                AgentEvent::Error(e) => return Err(e),
+                _ => {}
+            }
+        }
+        Err("stream ended without a result".to_string())
+    };
+    tokio::time::timeout(CLEAR_TIMEOUT, run).await.unwrap_or_else(|_| Err("/clear timed out".into()))
+}
+
+/// A session borrowed from the pool. Returns to the pool on Drop. Keep
+/// clones of `session` (e.g. inside an `Agent`) no longer than the
+/// `PooledSession`: after Drop another task may get the same session.
 pub struct PooledSession {
     pub session: Session,
     pool: SessionPool,
@@ -130,17 +148,16 @@ pub struct PooledSession {
 
 impl std::ops::Deref for PooledSession {
     type Target = Session;
-    fn deref(&self) -> &Self::Target { &self.session }
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
 }
 
 impl Drop for PooledSession {
     fn drop(&mut self) {
-        if self.session.is_alive() {
-            let pool = self.pool.clone();
-            let session = self.session.clone();
-            tokio::spawn(async move {
-                pool.0.idle.lock().await.push(session);
-            });
+        // Synchronous: safe to drop outside a Tokio runtime.
+        if self.session.is_alive() && !self.session.is_busy() {
+            self.pool.idle().push(Idle { session: self.session.clone(), used: true });
         }
         // Permit dropped here → semaphore released.
     }

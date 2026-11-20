@@ -1,8 +1,9 @@
 /// Persistent subprocess session — 3-task architecture.
 ///
 ///   reader_task   — reads stdout; answers CLI control requests (hooks,
-///                   can_use_tool), routes control responses to waiters,
-///                   broadcasts everything else
+///                   can_use_tool, mcp_message), routes control responses to
+///                   waiters, fans every other frame out to all subscribers
+///                   (one unbounded channel each: no frame is ever dropped)
 ///   writer_task   — drains the stdin channel into the subprocess
 ///   watchdog_task — waits for exit, marks the session dead, keeps stderr tail
 ///
@@ -15,14 +16,14 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
@@ -30,8 +31,8 @@ use crate::hooks::HookRegistry;
 use crate::mcp::{mcp_config_arg, SdkMcpServer};
 use crate::protocol::{
     CanUseToolRequest, ControlRequest, ControlRequestBody, ControlResponse,
-    InboundControlResponseBody, InboundMessage, Initialize, OutboundControlRequest,
-    ToolDecision,
+    InboundControlResponseBody, InboundMessage, Initialize, OutboundControlRequest, ResultMessage,
+    PermissionMode, ToolDecision,
 };
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -61,6 +62,8 @@ const STATE_DEAD: u8 = 2;
 const STDERR_TAIL_LINES: usize = 40;
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long `close()` waits after closing stdin, and after each signal.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 // ─── Options ─────────────────────────────────────────────────────────────────
 
@@ -94,8 +97,8 @@ pub struct SessionOptions {
     pub cwd: Option<PathBuf>,
     /// `--model`
     pub model: Option<String>,
-    /// `--permission-mode` (default, acceptEdits, plan, bypassPermissions, …)
-    pub permission_mode: Option<String>,
+    /// `--permission-mode`
+    pub permission_mode: Option<PermissionMode>,
     /// `--resume <id>`: continue an existing session's transcript.
     pub resume: Option<String>,
     /// Sets CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1. The stock 2.1.328 binary
@@ -121,12 +124,22 @@ pub struct SessionOptions {
     pub allowed_tools: Vec<String>,
     /// `--disallowedTools`: tools removed from the model's toolset.
     pub disallowed_tools: Vec<String>,
+    /// `--setting-sources`: which settings files to load ("user", "project",
+    /// "local"). `Some(vec![])` loads none — the session ignores the user's
+    /// global CLAUDE.md, skills, permission rules and hooks, and turns get
+    /// much cheaper. `None` = CLI default (all).
+    /// Source: subprocess_cli.py:275–280
+    pub setting_sources: Option<Vec<String>>,
+    /// `--settings`: extra settings JSON (permissions, env, shell `hooks`, …).
+    pub settings: Option<serde_json::Value>,
     /// Write every stdout line to this JSONL file, for `replay::replay`.
     pub record: Option<PathBuf>,
+    /// Start the CLI with an empty environment plus `env` only. The CLI then
+    /// needs at least HOME and PATH (and credentials) passed through `env`.
+    /// `false` (default) inherits the parent environment, like the official SDKs.
+    pub clear_env: bool,
     /// Extra env vars passed to the subprocess.
     pub env: Vec<(String, String)>,
-    /// Broadcast channel capacity for inbound events.
-    pub event_buffer: usize,
 }
 
 impl Default for SessionOptions {
@@ -145,16 +158,32 @@ impl Default for SessionOptions {
             mcp_servers: vec![],
             allowed_tools: vec![],
             disallowed_tools: vec![],
+            setting_sources: None,
+            settings: None,
             record: None,
+            clear_env: false,
             env: vec![],
-            event_buffer: 1024,
         }
     }
 }
 
 // ─── Session ─────────────────────────────────────────────────────────────────
 
-pub type EventRx = broadcast::Receiver<Arc<InboundMessage>>;
+/// Receives every frame the CLI emits after `subscribe()`; `None` once the
+/// CLI's stdout has ended.
+pub type EventRx = mpsc::UnboundedReceiver<Arc<InboundMessage>>;
+
+/// Subscribers of the reader task. `ended` turns new subscriptions into
+/// already-closed receivers once stdout is gone.
+#[derive(Default)]
+struct Fanout {
+    subs: Vec<mpsc::UnboundedSender<Arc<InboundMessage>>>,
+    ended: bool,
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 type Pending = DashMap<String, oneshot::Sender<InboundControlResponseBody>>;
 
@@ -171,6 +200,8 @@ pub(crate) struct Transport {
     pub(crate) stdout: Box<dyn AsyncRead + Unpin + Send>,
     /// Resolves when the CLI has exited.
     pub(crate) exit: Pin<Box<dyn Future<Output = ExitInfo> + Send>>,
+    /// Process group of the CLI and everything it started (Bash tools, …).
+    pub(crate) pgid: Option<i32>,
 }
 
 /// A live Claude Code session. Cheap to clone — backed by `Arc<SessionInner>`.
@@ -178,21 +209,25 @@ pub(crate) struct Transport {
 pub struct Session(Arc<SessionInner>);
 
 struct SessionInner {
-    /// Set from the first `system` frame (every system frame carries it).
-    session_id: OnceLock<String>,
+    /// Current session id; every `system` frame carries it and `/clear`
+    /// starts a new one.
+    session_id: Arc<RwLock<Option<String>>>,
     /// `None` after `close()`; dropping the last sender ends the writer task,
     /// which closes the CLI's stdin.
     stdin_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    /// Weak: the reader task owns the only strong sender, so the channel
-    /// closes when the CLI's stdout ends and waiting streams see it.
-    event_tx: broadcast::WeakSender<Arc<InboundMessage>>,
+    fanout: Arc<std::sync::Mutex<Fanout>>,
     /// Host-initiated control requests awaiting a `control_response`.
     pending: Arc<Pending>,
     next_request_id: AtomicU64,
     state: Arc<AtomicU8>,
-    exit: Arc<Mutex<Option<ExitInfo>>>,
+    exit: watch::Receiver<Option<ExitInfo>>,
+    pgid: Option<i32>,
     include_partial: bool,
     initialize_response: OnceLock<serde_json::Value>,
+    /// Prompts sent whose `result` has not arrived yet.
+    turns_in_flight: Arc<AtomicUsize>,
+    /// `true` once the reader has handled the last stdout line.
+    reader_done: watch::Receiver<bool>,
     _tasks: [JoinHandle<()>; 3],
 }
 
@@ -230,8 +265,8 @@ impl Session {
         if let Some(ref m) = opts.model {
             cmd.args(["--model", m]);
         }
-        if let Some(ref pm) = opts.permission_mode {
-            cmd.args(["--permission-mode", pm]);
+        if let Some(pm) = opts.permission_mode {
+            cmd.args(["--permission-mode", pm.as_str()]);
         }
         if let Some(ref id) = opts.resume {
             cmd.args(["--resume", id]);
@@ -251,6 +286,12 @@ impl Session {
         if !opts.disallowed_tools.is_empty() {
             cmd.args(["--disallowedTools", &opts.disallowed_tools.join(",")]);
         }
+        if let Some(ref sources) = opts.setting_sources {
+            cmd.args(["--setting-sources", &sources.join(",")]);
+        }
+        if let Some(ref settings) = opts.settings {
+            cmd.args(["--settings", &settings.to_string()]);
+        }
         if let Some(ref cwd) = opts.cwd {
             cmd.current_dir(cwd);
         }
@@ -260,15 +301,23 @@ impl Session {
         if opts.tool_search {
             cmd.env("ENABLE_TOOL_SEARCH", "1");
         }
+        if opts.clear_env {
+            cmd.env_clear();
+        }
         for (k, v) in &opts.env {
             cmd.env(k, v);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(false); // closing stdin lets the CLI finish and exit
+            .kill_on_drop(false); // close() / Drop end the whole process group instead
+        // Own process group: tools the CLI starts (Bash, background tasks)
+        // join it, so close() and Drop can end them too.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd.spawn()?;
+        let pgid = child.id().and_then(|id| i32::try_from(id).ok());
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -286,19 +335,22 @@ impl Session {
             let code = child.wait().await.ok().and_then(|s| s.code());
             ExitInfo { code, stderr: Vec::from(tail).join("\n") }
         });
-        let transport = Transport { stdin: Box::new(stdin), stdout: Box::new(stdout), exit };
+        let transport = Transport { stdin: Box::new(stdin), stdout: Box::new(stdout), exit, pgid };
         Self::connect(transport, opts, init).await
     }
 
     /// Run the session over an already-started CLI (process or replay) and
     /// complete the initialize handshake.
     pub(crate) async fn connect(transport: Transport, opts: SessionOptions, mut init: Initialize) -> Result<Self> {
-        let Transport { stdin, stdout, exit: exit_fut } = transport;
+        let Transport { stdin, stdout, exit: exit_fut, pgid } = transport;
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(256);
-        let (event_tx, _) = broadcast::channel(opts.event_buffer);
+        let fanout = Arc::new(std::sync::Mutex::new(Fanout::default()));
+        let session_id = Arc::new(RwLock::new(None));
         let pending: Arc<Pending> = Arc::new(DashMap::new());
         let state = Arc::new(AtomicU8::new(STATE_RUNNING));
-        let exit = Arc::new(Mutex::new(None));
+        let (exit_tx, exit_rx) = watch::channel(None);
+        let (reader_done_tx, reader_done) = watch::channel(false);
+        let turns_in_flight = Arc::new(AtomicUsize::new(0));
 
         let writer = tokio::spawn(async move {
             let mut w = BufWriter::new(stdin);
@@ -313,11 +365,11 @@ impl Session {
             let _ = w.shutdown().await;
         });
 
-        let (exit2, state2) = (exit.clone(), state.clone());
+        let state2 = state.clone();
         let watchdog = tokio::spawn(async move {
             let info = exit_fut.await;
-            *exit2.lock().await = Some(info);
             state2.store(STATE_DEAD, Ordering::SeqCst);
+            let _ = exit_tx.send(Some(info));
         });
 
         let record = match &opts.record {
@@ -330,22 +382,31 @@ impl Session {
             can_use_tool: opts.can_use_tool.clone(),
             mcp_servers: opts.mcp_servers.clone(),
         });
-        let event_weak = event_tx.downgrade();
-        let reader = tokio::spawn(read_loop(stdout, record, event_tx, pending.clone(), responder));
+        let reader = tokio::spawn(read_loop(stdout, Reader {
+            record,
+            fanout: fanout.clone(),
+            session_id: session_id.clone(),
+            pending: pending.clone(),
+            turns_in_flight: turns_in_flight.clone(),
+            responder,
+            done: reader_done_tx,
+        }));
 
         let session = Session(Arc::new(SessionInner {
-            session_id: OnceLock::new(),
+            session_id,
             stdin_tx: Mutex::new(Some(stdin_tx)),
-            event_tx: event_weak,
+            fanout,
             pending,
             next_request_id: AtomicU64::new(0),
             state,
-            exit,
+            exit: exit_rx,
+            pgid,
             include_partial: opts.include_partial,
             initialize_response: OnceLock::new(),
+            turns_in_flight,
+            reader_done,
             _tasks: [reader, writer, watchdog],
         }));
-        session.track_session_id();
 
         init.hooks = opts.hooks.initialize_config();
         let body = serde_json::to_value(&init)?;
@@ -377,24 +438,50 @@ impl Session {
         self.request_with_timeout(body, CONTROL_TIMEOUT).await
     }
 
-    /// Interrupt the running turn.
+    /// Interrupt the running turn; its stream ends with
+    /// an `AgentEvent::Error` starting with `"error_during_execution"`.
     pub async fn interrupt(&self) -> Result<()> {
         self.control(&serde_json::json!({ "subtype": "interrupt" })).await.map(|_| ())
     }
 
-    /// Subscribe to the broadcast event stream.
-    pub fn subscribe(&self) -> EventRx {
-        match self.0.event_tx.upgrade() {
-            Some(tx) => tx.subscribe(),
-            // The CLI's stdout has ended: hand out an already-closed receiver.
-            None => broadcast::channel(1).1,
-        }
+    /// Switch model for the following turns; `None` restores the session default.
+    /// Source: binary set_model schema
+    pub async fn set_model(&self, model: Option<&str>) -> Result<()> {
+        self.control(&serde_json::json!({ "subtype": "set_model", "model": model })).await.map(|_| ())
     }
 
-    /// Session ID — known once the CLI emits its first `system` frame
-    /// (hook events right after spawn, or `system/init` on the first turn).
-    pub fn session_id(&self) -> Option<&str> {
-        self.0.session_id.get().map(String::as_str)
+    /// Source: binary set_permission_mode schema
+    pub async fn set_permission_mode(&self, mode: PermissionMode) -> Result<()> {
+        self.control(&serde_json::json!({ "subtype": "set_permission_mode", "mode": mode })).await.map(|_| ())
+    }
+
+    /// Stop a background task by its `task_id` (see `AgentEvent::BackgroundTasks`).
+    /// Source: binary stop_task schema
+    pub async fn stop_task(&self, task_id: &str) -> Result<()> {
+        self.control(&serde_json::json!({ "subtype": "stop_task", "task_id": task_id })).await.map(|_| ())
+    }
+
+    /// Context-window usage of the session, as reported by the CLI.
+    /// Source: binary get_context_usage schema
+    pub async fn context_usage(&self) -> Result<serde_json::Value> {
+        self.control(&serde_json::json!({ "subtype": "get_context_usage" })).await
+    }
+
+    /// Receive every frame the CLI emits from now on. Lossless: a slow
+    /// receiver buffers instead of dropping frames.
+    pub fn subscribe(&self) -> EventRx {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut fanout = lock(&self.0.fanout);
+        if !fanout.ended {
+            fanout.subs.push(tx);
+        }
+        rx
+    }
+
+    /// Current session id — known once the CLI emits its first `system`
+    /// frame; changes after `/clear`.
+    pub fn session_id(&self) -> Option<String> {
+        self.0.session_id.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// Payload of the initialize `control_response` (commands, models, account, …).
@@ -406,27 +493,66 @@ impl Session {
         self.0.include_partial
     }
 
+    /// Whether a prompt sent with `Agent` is still waiting for its `result`.
+    pub fn is_busy(&self) -> bool {
+        self.0.turns_in_flight.load(Ordering::Acquire) > 0
+    }
+
+    /// Send a prompt and count it as in flight until its `result`. Counted
+    /// before the write, so a fast `result` cannot arrive first.
+    pub(crate) async fn send_prompt(&self, message: &crate::protocol::UserMessage) -> Result<()> {
+        self.0.turns_in_flight.fetch_add(1, Ordering::AcqRel);
+        let sent = self.send(message).await;
+        if sent.is_err() {
+            decrement(&self.0.turns_in_flight);
+        }
+        sent
+    }
+
     /// Whether the subprocess is still running.
     pub fn is_alive(&self) -> bool {
         self.0.state.load(Ordering::Acquire) == STATE_RUNNING
     }
 
-    /// Close stdin and wait (up to 30 s) for the CLI to finish and exit.
-    /// Returns the exit code once the process has exited.
-    /// Source: subprocess_cli.py:517–521 (end_input)
+    /// End the session: close stdin and give the CLI 5 s to exit, then
+    /// SIGTERM, then SIGKILL its process group. Tools it started (background
+    /// Bash commands keep the CLI alive past stdin EOF) end with it.
+    /// Returns the CLI's exit code (`None` when it ended by a signal).
     pub async fn close(&self) -> Option<i32> {
-        if self.0.state.load(Ordering::Acquire) == STATE_RUNNING {
-            self.0.state.store(STATE_CLOSING, Ordering::SeqCst);
-        }
+        let _ = self.0.state.compare_exchange(STATE_RUNNING, STATE_CLOSING, Ordering::SeqCst, Ordering::SeqCst);
         self.0.stdin_tx.lock().await.take();
-        for _ in 0..300 {
-            if let Some(info) = self.0.exit.lock().await.as_ref() {
-                return info.code;
+        let mut exit = self.wait_exit(CLOSE_GRACE).await;
+        #[cfg(unix)]
+        for signal in [nix::sys::signal::Signal::SIGTERM, nix::sys::signal::Signal::SIGKILL] {
+            if exit.is_some() {
+                break;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.signal_group(signal);
+            exit = self.wait_exit(CLOSE_GRACE).await;
         }
-        tracing::warn!("CLI did not exit within 30 s of closing stdin");
-        None
+        // Children the CLI left running share its process group.
+        #[cfg(unix)]
+        self.signal_group(nix::sys::signal::Signal::SIGTERM);
+        // Let the reader finish the last lines (and the recording).
+        let mut done = self.0.reader_done.clone();
+        let _ = tokio::time::timeout(CLOSE_GRACE, done.wait_for(|d| *d)).await;
+        exit.and_then(|e| e.code)
+    }
+
+    async fn wait_exit(&self, timeout: Duration) -> Option<ExitInfo> {
+        let mut rx = self.0.exit.clone();
+        let waited = tokio::time::timeout(timeout, async {
+            rx.wait_for(Option::is_some).await.ok().and_then(|info| info.clone())
+        })
+        .await;
+        waited.ok().flatten()
+    }
+
+    #[cfg(unix)]
+    fn signal_group(&self, signal: nix::sys::signal::Signal) {
+        if let Some(pgid) = self.0.pgid {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), signal);
+        }
     }
 
     // ── internals ────────────────────────────────────────────────────────────
@@ -447,6 +573,12 @@ impl Session {
         // Register before writing so a fast response cannot arrive unmatched.
         let (tx, rx) = oneshot::channel();
         self.0.pending.insert(request_id.clone(), tx);
+        // The reader marks `ended` before it drops all waiters; a request
+        // registered after that would never be answered.
+        if lock(&self.0.fanout).ended {
+            self.0.pending.remove(&request_id);
+            return Err(self.dead_error().await);
+        }
         let envelope = OutboundControlRequest { kind: "control_request", request_id: &request_id, request: body };
         if let Err(e) = self.send(&envelope).await {
             self.0.pending.remove(&request_id);
@@ -473,38 +605,36 @@ impl Session {
 
     /// Error describing why the process is gone, with its stderr tail.
     async fn dead_error(&self) -> SessionError {
-        // The watchdog records the exit right after stdout/stderr close.
-        for _ in 0..50 {
-            if let Some(ExitInfo { code, stderr }) = self.0.exit.lock().await.clone() {
-                return SessionError::ProcessExited { code, stderr };
-            }
-            if self.0.state.load(Ordering::Acquire) == STATE_CLOSING {
-                return SessionError::Closed;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        if self.0.state.load(Ordering::Acquire) == STATE_CLOSING {
+            return SessionError::Closed;
         }
-        SessionError::Closed
+        // The watchdog records the exit right after stdout/stderr close.
+        match self.wait_exit(Duration::from_secs(1)).await {
+            Some(ExitInfo { code, stderr }) => SessionError::ProcessExited { code, stderr },
+            None => SessionError::Closed,
+        }
     }
+}
 
-    fn track_session_id(&self) {
-        let mut rx = self.subscribe();
-        let inner = Arc::downgrade(&self.0);
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        if let InboundMessage::System(ref s) = *msg {
-                            if let Some(inner) = inner.upgrade() {
-                                let _ = inner.session_id.set(s.session_id.clone());
-                            }
-                            return;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
+impl Drop for SessionInner {
+    /// Dropping the last handle ends the CLI and the tools it started.
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid
+            && self.state.load(Ordering::Acquire) != STATE_DEAD {
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::Signal::SIGTERM);
             }
-        });
+    }
+}
+
+/// Decrement, stopping at zero.
+fn decrement(n: &AtomicUsize) {
+    let mut current = n.load(Ordering::Acquire);
+    while current > 0 {
+        match n.compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
     }
 }
 
@@ -515,31 +645,33 @@ fn with_subtype(mut body: serde_json::Value, subtype: &str) -> serde_json::Value
     body
 }
 
-async fn read_loop(
-    stdout: Box<dyn AsyncRead + Unpin + Send>,
-    mut record: Option<tokio::fs::File>,
-    event_tx: broadcast::Sender<Arc<InboundMessage>>,
+/// State the reader task shares with the Session.
+struct Reader {
+    record: Option<tokio::fs::File>,
+    fanout: Arc<std::sync::Mutex<Fanout>>,
+    session_id: Arc<RwLock<Option<String>>>,
     pending: Arc<Pending>,
+    turns_in_flight: Arc<AtomicUsize>,
     responder: Arc<Responder>,
-) {
+    done: watch::Sender<bool>,
+}
+
+async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
+    let Reader { mut record, fanout, session_id, pending, turns_in_flight, responder, done: reader_done } = reader;
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(file) = record.as_mut() {
-            if file.write_all(line.as_bytes()).await.is_err() || file.write_all(b"\n").await.is_err() {
-                tracing::warn!("recording failed; continuing without it");
-                record = None;
-            }
+        if let Some(file) = record.as_mut()
+            && (file.write_all(line.as_bytes()).await.is_err()
+                || file.write_all(b"\n").await.is_err()
+                || file.flush().await.is_err())
+        {
+            tracing::warn!("recording failed; continuing without it");
+            record = None;
         }
-        let msg: InboundMessage = match serde_json::from_str(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(error = %e, line = %line, "unparsed stdout line");
-                InboundMessage::Unknown
-            }
-        };
+        let msg = parse_frame(&line);
         match msg {
             InboundMessage::ControlResponse(r) => {
                 if let Some((_, tx)) = pending.remove(&r.response.request_id) {
@@ -548,21 +680,86 @@ async fn read_loop(
             }
             InboundMessage::ControlRequest(req) => {
                 // Answer without blocking the reader: hooks may run long.
+                // The handler runs in its own task, so a panic in user code
+                // still sends an error response instead of leaving the CLI
+                // waiting.
                 let responder = responder.clone();
-                tokio::spawn(async move { responder.answer(req).await });
+                tokio::spawn(async move {
+                    let request_id = req.request_id.clone();
+                    let handler = responder.clone();
+                    let response = match tokio::spawn(async move { handler.respond(req).await }).await {
+                        Ok(response) => response,
+                        Err(e) => ControlResponse::error(&request_id, format!("handler failed: {e}")),
+                    };
+                    responder.write(&response).await;
+                });
             }
             other => {
-                let _ = event_tx.send(Arc::new(other));
+                if let InboundMessage::Result(ref r) = other
+                    && r.origin.is_none()
+                {
+                    decrement(&turns_in_flight);
+                }
+                if let InboundMessage::System(ref s) = other {
+                    let mut id = session_id.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if id.as_deref() != Some(s.session_id.as_str()) {
+                        *id = Some(s.session_id.clone());
+                    }
+                }
+                let msg = Arc::new(other);
+                lock(&fanout).subs.retain(|tx| tx.send(msg.clone()).is_ok());
             }
         }
     }
-    // EOF: drop every waiter so it reports the exit instead of hanging.
+    // EOF: close every subscriber and drop every waiter, so streams and
+    // control requests report the exit instead of hanging.
+    {
+        let mut f = lock(&fanout);
+        f.ended = true;
+        f.subs.clear();
+    }
     pending.clear();
+    turns_in_flight.store(0, Ordering::Release);
+    drop(record);
+    let _ = reader_done.send(true);
+}
+
+/// Decode one stdout line. A `result` the typed model cannot decode still
+/// ends its turn, as a minimal result, so no stream waits forever.
+fn parse_frame(line: &str) -> InboundMessage {
+    match serde_json::from_str(line) {
+        Ok(m) => m,
+        Err(e) => {
+            let value: Option<serde_json::Value> = serde_json::from_str(line).ok();
+            let field = |k: &str| value.as_ref().and_then(|v| v.get(k)).and_then(|v| v.as_str()).map(str::to_owned);
+            if field("type").as_deref() == Some("result") {
+                tracing::warn!(error = %e, "undecodable result frame; ending the turn with it");
+                InboundMessage::Result(ResultMessage {
+                    subtype: field("subtype").unwrap_or_else(|| "error_unparsed_result".into()),
+                    is_error: value.as_ref().and_then(|v| v.get("is_error")).and_then(|v| v.as_bool()).unwrap_or(false),
+                    result: field("result"),
+                    session_id: field("session_id"),
+                    origin: value.as_ref().and_then(|v| v.get("origin")).cloned(),
+                    ..ResultMessage::default()
+                })
+            } else if let (Some("control_request"), Some(request_id)) = (field("type").as_deref(), value.as_ref().and_then(|v| v.get("request_id")).and_then(|v| v.as_str())) {
+                // The CLI waits for an answer; an error reply beats a hang.
+                tracing::warn!(error = %e, "undecodable control_request; answering with an error");
+                InboundMessage::ControlRequest(ControlRequest {
+                    request_id: request_id.to_owned(),
+                    request: ControlRequestBody::Unsupported,
+                })
+            } else {
+                tracing::debug!(error = %e, line = %line, "unparsed stdout line");
+                InboundMessage::Unknown
+            }
+        }
+    }
 }
 
 impl Responder {
-    async fn answer(&self, req: ControlRequest) {
-        let response = match req.request {
+    async fn respond(&self, req: ControlRequest) -> ControlResponse {
+        match req.request {
             ControlRequestBody::HookCallback(hcb) => {
                 let span = tracing::info_span!(
                     "claude.hook",
@@ -623,8 +820,11 @@ impl Responder {
             ControlRequestBody::Unsupported => {
                 ControlResponse::error(&req.request_id, "unsupported control request subtype")
             }
-        };
-        match serde_json::to_vec(&response) {
+        }
+    }
+
+    async fn write(&self, response: &ControlResponse) {
+        match serde_json::to_vec(response) {
             Ok(bytes) => match self.stdin_tx.upgrade() {
                 Some(tx) => {
                     let _ = tx.send(bytes).await;

@@ -56,6 +56,32 @@ pub struct HookMatcherConfig {
     pub timeout: Option<u32>,
 }
 
+/// Permission modes accepted by `--permission-mode` and `set_permission_mode`.
+/// Source: binary permission-mode enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    Default,
+    AcceptEdits,
+    BypassPermissions,
+    Plan,
+    DontAsk,
+    Auto,
+}
+
+impl PermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::BypassPermissions => "bypassPermissions",
+            Self::Plan => "plan",
+            Self::DontAsk => "dontAsk",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 /// A user turn.
 /// Source: _internal/client.py:126–131
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,12 +97,14 @@ pub struct UserMessage {
 
 impl UserMessage {
     pub fn text(content: impl Into<String>) -> Self {
+        Self::blocks(vec![ContentBlock::Text { text: content.into() }])
+    }
+
+    /// A message with several blocks, e.g. text plus images.
+    pub fn blocks(content: Vec<ContentBlock>) -> Self {
         Self {
             kind: "user".into(),
-            message: UserMessageBody {
-                role: "user".into(),
-                content: vec![ContentBlock::Text { text: content.into() }],
-            },
+            message: UserMessageBody { role: "user".into(), content },
             parent_tool_use_id: None,
             uuid: uuid::Uuid::new_v4().to_string(),
         }
@@ -94,11 +122,30 @@ pub struct UserMessageBody {
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
         content: Vec<ContentBlock>,
     },
+}
+
+impl ContentBlock {
+    /// An image from base64 data; `media_type` e.g. "image/png".
+    pub fn image_base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self::Image {
+            source: ImageSource::Base64 { media_type: media_type.into(), data: data.into() },
+        }
+    }
+}
+
+/// Anthropic Messages API image source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ImageSource {
+    Base64 { media_type: String, data: String },
+    Url { url: String },
 }
 
 /// Envelope for every host → CLI answer to a CLI-initiated control request.
@@ -383,9 +430,20 @@ pub struct StreamEventMessage {
 
 /// Turn complete.
 /// Source: chunk-20bv8pca.js:14425–14913
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResultMessage {
-    pub subtype: String, // "success" | "error_*"
+    /// "success" | "error_*". A failed API call still comes as "success"
+    /// with `is_error: true` and the message in `result`.
+    #[serde(default)]
+    pub subtype: String,
+    #[serde(default)]
+    pub is_error: bool,
+    /// Final text of the turn, or the error message when `is_error`.
+    #[serde(default)]
+    pub result: Option<String>,
+    /// Error details of `error_*` subtypes.
+    #[serde(default)]
+    pub errors: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -398,8 +456,6 @@ pub struct ResultMessage {
     pub usage: Option<UsageSummary>,
     #[serde(default)]
     pub stop_reason: Option<String>,
-    #[serde(default)]
-    pub error: Option<String>,
     /// Set when the CLI started the turn itself (e.g. `{"kind":"task-notification"}`
     /// after a background task finished); absent for turns the host prompted.
     #[serde(default)]
@@ -409,14 +465,30 @@ pub struct ResultMessage {
 }
 
 impl ResultMessage {
-    pub fn is_success(&self) -> bool { self.subtype == "success" }
+    pub fn is_success(&self) -> bool {
+        self.subtype == "success" && !self.is_error
+    }
+
+    /// Why the turn failed: for `is_error` the CLI's message; for
+    /// `error_*` subtypes the subtype, then its `errors` details.
+    pub fn error_message(&self) -> String {
+        if let Some(r) = self.result.as_ref().filter(|r| self.is_error && !r.is_empty()) {
+            return r.clone();
+        }
+        let details: Vec<String> = self.errors.iter().flatten()
+            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+            .collect();
+        if details.is_empty() { self.subtype.clone() } else { format!("{}: {}", self.subtype, details.join("; ")) }
+    }
 }
 
 /// Token usage breakdown.
 /// Source: chunk-20bv8pca.js:11526–11530
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct UsageSummary {
+    #[serde(default)]
     pub input_tokens: u64,
+    #[serde(default)]
     pub output_tokens: u64,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
@@ -616,22 +688,3 @@ pub enum HookEventKind {
     MessageDisplay,
 }
 
-impl HookEventKind {
-    /// Default timeout for this event kind.
-    /// Source: chunk-0f728242.js:432–448
-    pub fn default_timeout_ms(&self) -> u64 {
-        match self {
-            HookEventKind::PreToolUse
-            | HookEventKind::PostToolUse
-            | HookEventKind::PostToolUseFailure
-            | HookEventKind::PostToolBatch
-            | HookEventKind::PermissionDenied
-            | HookEventKind::SubagentStart => 15_000,
-            HookEventKind::UserPromptSubmit | HookEventKind::UserPromptExpansion => 30_000,
-            HookEventKind::Stop | HookEventKind::StopFailure | HookEventKind::SubagentStop => {
-                120_000
-            }
-            _ => 10_000, // conservative default for unspecified events
-        }
-    }
-}

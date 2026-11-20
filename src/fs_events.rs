@@ -18,6 +18,12 @@
 ///     }
 /// });
 /// ```
+///
+/// Limitation (verified against 2.1.328): the CLI delivers CwdChanged and
+/// FileChanged to shell hooks declared in settings (`SessionOptions::settings`)
+/// but not to SDK hook callbacks. Use `FsEvent::from_payload` on the JSON a
+/// settings hook receives, or on payloads from a CLI version that forwards them.
+///
 /// Source: binary hook input schemas (FileChanged: file_path, event;
 /// CwdChanged: old_cwd, new_cwd; DirectoryAdded: directory)
 use crate::protocol::{HookEventKind, HookEventPayload};

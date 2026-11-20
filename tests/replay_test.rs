@@ -56,7 +56,7 @@ async fn prompt_stream_holds_only_its_own_turn() {
 
     let (text, r2) = turn(&agent, "second").await;
     assert_eq!((text.as_str(), r2.total_cost_usd), ("two", Some(0.3)));
-    assert_eq!(agent.session().session_id(), Some("s1"));
+    assert_eq!(agent.session().session_id().as_deref(), Some("s1"));
 
     // Slash command: the CLI echoes the prompt after the command's frames.
     let mut stream = agent.prompt("/compact").await.expect("send");
