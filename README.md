@@ -239,6 +239,16 @@ CLI 2.1.329 routes these kinds to an SDK host. The handler receives every kind t
 - `UserMessage::with_timestamp` is sent, but CLI 2.1.329 records its own receive time.
 - No credential handling: the CLI uses its own login.
 
+## Releasing
+
+Bump `version` in both `Cargo.toml` files (the crate and `claude-code-agent-macros`, plus the dependency on it), push to `main`, then push the matching tag:
+
+```sh
+git tag -a v0.6.1 -m v0.6.1 && git push origin v0.6.1
+```
+
+`.github/workflows/release.yml` runs the CI checks on Linux, macOS and Windows, then publishes both crates through crates.io Trusted Publishing. No token is stored in the repository.
+
 ## License
 
 MIT
