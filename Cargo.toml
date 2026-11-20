@@ -23,6 +23,7 @@ claude-sdk-macros      = { version = "0.2.0", path = "claude-sdk-macros", option
 tokio-stream = "0.1.19"
 async-stream = "0.3.6"
 uuid = { version = "1.29.3", features = ["v4"] }
+regex = { version = "1.13.2", default-features = false, features = ["std", "perf", "unicode-perl"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.32.0", features = ["signal"] }

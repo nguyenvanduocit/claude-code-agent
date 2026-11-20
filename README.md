@@ -6,6 +6,7 @@ Rust SDK for [Claude Code](https://claude.ai/claude-code). It drives the `claude
 - hook callbacks and `can_use_tool` permission handlers as async Rust closures
 - Rust functions as tools (`#[claude_tool]` + SDK MCP bridge), executed in-process
 - control requests: `interrupt`, `set_model`, `set_permission_mode`, `stop_task`, `context_usage`
+- Code Mode (`REPL` tool) forced on with `code_mode: true`
 - text and image prompts (`UserMessage::blocks` + `ContentBlock::image_base64`)
 - record/replay for tests without a process, session pool, `tracing` spans
 
@@ -133,6 +134,14 @@ let mut stream = claude_sdk::compaction::compact(&agent, Some("keep file paths a
 
 `tracing` spans `claude.turn`, `claude.hook`, `claude.tool` — export with any subscriber (e.g. `tracing-opentelemetry`).
 
+## Code Mode
+
+```rust
+let opts = SessionOptions { code_mode: true, ..Default::default() };
+```
+
+Claude gets the `REPL` tool and works by writing JavaScript that calls its tools. The stock CLI refuses Code Mode for every non-interactive session, so the SDK runs a patched copy. It is built on first use (about 6 s), cached under `~/.cache/claude-sdk/code-mode/`, and re-signed on macOS. The installed `claude` is not modified. The patch changes only the Code Mode opt-in module: the eligibility check passes, the caveats count as accepted, and the server gate counts as open. See DESIGN.md.
+
 ## Session options worth knowing
 
 | Option | Effect |
@@ -152,7 +161,7 @@ let mut stream = claude_sdk::compaction::compact(&agent, Some("keep file paths a
 
 ## Limitations
 
-- Code Mode: `code_mode` sets `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`, which the stock 2.1.328 binary ignores (internal gate).
+- `code_mode` runs a patched copy of the CLI. The patch anchors on minified code, so a CLI release that changes the Code Mode module makes spawn fail with `CodeModeError::Anchor` until the anchors are updated. Verified on 2.1.329.
 - Tool results from SDK tools are text.
 - No credential handling: the CLI uses its own login.
 

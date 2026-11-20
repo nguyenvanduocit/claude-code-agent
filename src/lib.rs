@@ -112,6 +112,7 @@
 
 pub mod agent;
 pub mod background;
+pub mod code_mode;
 pub mod compaction;
 pub mod fs_events;
 pub mod hooks;

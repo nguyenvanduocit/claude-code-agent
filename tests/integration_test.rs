@@ -317,3 +317,16 @@ async fn api_error_ends_turn_with_error() {
     eprintln!("error={message:?}");
     assert!(message.contains("claude-nonexistent-9"), "{message}");
 }
+
+/// `code_mode` runs a patched CLI copy: the REPL tool exists and Claude uses it.
+#[tokio::test]
+#[ignore = "requires a real claude binary and valid credentials"]
+async fn code_mode_exposes_repl() {
+    let opts = SessionOptions { code_mode: true, setting_sources: Some(vec![]), ..Default::default() };
+    let session = Session::spawn(opts, Initialize::default()).await.expect("spawn");
+    let agent = Agent::new(session);
+    let (text, tools, _) = turn(&agent, "Use your REPL tool to compute 6*7 in JavaScript. Reply with just the number.").await;
+    eprintln!("tools={tools:?} text={text:?}");
+    assert!(tools.iter().any(|t| t == "REPL"), "REPL not used: {tools:?}");
+    assert!(text.contains("42"), "{text}");
+}

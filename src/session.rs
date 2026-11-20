@@ -51,6 +51,8 @@ pub enum SessionError {
     ControlError { subtype: String, error: String },
     #[error("control request `{0}` timed out")]
     ControlTimeout(String),
+    #[error("code mode: {0}")]
+    CodeMode(#[from] crate::code_mode::CodeModeError),
 }
 
 pub type Result<T> = std::result::Result<T, SessionError>;
@@ -101,11 +103,10 @@ pub struct SessionOptions {
     pub permission_mode: Option<PermissionMode>,
     /// `--resume <id>`: continue an existing session's transcript.
     pub resume: Option<String>,
-    /// Sets CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1. The stock 2.1.328 binary
-    /// also gates Code Mode on internal/experiment checks, so this env var
-    /// alone does not enable it there (verified: no REPL/Eval tool appears);
-    /// it takes effect on builds where those gates pass.
-    /// Source: chunk-0jv1f6sm.codeModeShape.js:13–15
+    /// Force Code Mode on: Claude gets the `REPL` tool and works by writing
+    /// JavaScript that calls its tools. The stock CLI refuses Code Mode for
+    /// SDK sessions, so this runs a patched copy of `binary`, built once and
+    /// cached (see `code_mode` module); the installed CLI is not modified.
     pub code_mode: bool,
     /// Enable tool search: sets ENABLE_TOOL_SEARCH=1.
     /// Source: chunk-dnmy4w56.js:189
@@ -130,7 +131,8 @@ pub struct SessionOptions {
     /// much cheaper. `None` = CLI default (all).
     /// Source: subprocess_cli.py:275–280
     pub setting_sources: Option<Vec<String>>,
-    /// `--settings`: extra settings JSON (permissions, env, shell `hooks`, …).
+    /// `--settings`: inline settings object (permissions, env, shell `hooks`, …),
+    /// or a string: path of a settings file.
     pub settings: Option<serde_json::Value>,
     /// Write every stdout line to this JSONL file, for `replay::replay`.
     pub record: Option<PathBuf>,
@@ -249,7 +251,16 @@ impl Session {
     ///   2. write the `initialize` control request (with `opts.hooks`)
     ///   3. wait for its `control_response`
     pub async fn spawn(opts: SessionOptions, init: Initialize) -> Result<Self> {
-        let mut cmd = Command::new(&opts.binary);
+        let binary = if opts.code_mode {
+            crate::code_mode::patched_binary(&opts.binary).await?
+        } else {
+            opts.binary.clone()
+        };
+        let mut cmd = Command::new(&binary);
+        // First, so the variables set below survive it.
+        if opts.clear_env {
+            cmd.env_clear();
+        }
         cmd.args([
             "--output-format", "stream-json",
             "--verbose",
@@ -289,8 +300,15 @@ impl Session {
         if let Some(ref sources) = opts.setting_sources {
             cmd.args(["--setting-sources", &sources.join(",")]);
         }
-        if let Some(ref settings) = opts.settings {
-            cmd.args(["--settings", &settings.to_string()]);
+        match settings_arg(&opts)? {
+            // A string is a settings file path; anything else is inline JSON.
+            Some(serde_json::Value::String(path)) => {
+                cmd.args(["--settings", &path]);
+            }
+            Some(settings) => {
+                cmd.args(["--settings", &settings.to_string()]);
+            }
+            None => {}
         }
         if let Some(ref cwd) = opts.cwd {
             cmd.current_dir(cwd);
@@ -300,9 +318,6 @@ impl Session {
         }
         if opts.tool_search {
             cmd.env("ENABLE_TOOL_SEARCH", "1");
-        }
-        if opts.clear_env {
-            cmd.env_clear();
         }
         for (k, v) in &opts.env {
             cmd.env(k, v);
@@ -636,6 +651,22 @@ fn decrement(n: &AtomicUsize) {
             Err(actual) => current = actual,
         }
     }
+}
+
+/// `--settings` value: the caller's settings, plus the Code Mode env var,
+/// which the CLI honours only when it comes from settings, not the shell.
+fn settings_arg(opts: &SessionOptions) -> Result<Option<serde_json::Value>> {
+    if !opts.code_mode {
+        return Ok(opts.settings.clone());
+    }
+    let mut settings = opts.settings.clone().unwrap_or_else(|| serde_json::json!({}));
+    let env = settings
+        .as_object_mut()
+        .map(|obj| obj.entry("env").or_insert_with(|| serde_json::json!({})))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(crate::code_mode::CodeModeError::Settings)?;
+    env.insert("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE".into(), "1".into());
+    Ok(Some(settings))
 }
 
 fn with_subtype(mut body: serde_json::Value, subtype: &str) -> serde_json::Value {
