@@ -23,9 +23,9 @@
 //! `&mut T` and `impl Trait` parameters are rejected; use the owned type.
 //!
 //! The return value becomes the tool result, chosen by its type (aliases
-//! included): `Result<T, E>` → `T` or an error result with `E: Display`;
-//! `ToolResult` → passed through; `()` → "ok"; anything else → serde JSON
-//! (strings verbatim).
+//! included): `Result<T, E>` → `T` by these same rules, or an error result
+//! with `E: Display`; `ToolResult` → passed through; `()` → "ok"; anything
+//! else → serde JSON (strings verbatim).
 //!
 //! Type mapping for the input schema (by the last path segment's name):
 //! ```text
@@ -152,13 +152,18 @@ fn impl_claude_tool(func: &ItemFn) -> syn::Result<TokenStream2> {
 
     // The impl picked depends on the returned value's type; see
     // `claude_code_agent::__private::ret`.
+    // Two steps: unwrap a `Result` (its error becomes an error result),
+    // then convert the value by its own type.
     let convert = quote! {{
         #[allow(unused_imports)]
         use ::claude_code_agent::__private::ret::{
-            ResultKind as _, SerializeKind as _, ToolResultKind as _, UnitKind as _,
+            PlainKind as _, ResultKind as _, SerializeKind as _, ToolResultKind as _, UnitKind as _,
         };
         let __ret = #call;
-        (&__ret).__claude_tool_kind().convert(__ret)
+        match (&__ret).__claude_tool_unwrap_kind().unwrap(__ret) {
+            ::core::result::Result::Ok(__value) => (&__value).__claude_tool_kind().convert(__value),
+            ::core::result::Result::Err(__error) => __error,
+        }
     }};
 
     Ok(quote! {
@@ -276,9 +281,16 @@ fn type_to_schema(ty: &Type) -> (bool, TokenStream2) {
     (optional, schema.unwrap_or_else(|| quote! { {} }))
 }
 
-/// `Some(first type argument)` if `ty` is `Option<_>`.
+/// `Some(first type argument)` if `ty` is `Option<_>` (also behind `&`,
+/// which is deserialized owned).
 fn option_inner(ty: &Type) -> Option<Option<&Type>> {
-    let Type::Path(tp) = ty else { return None };
+    let tp = match ty {
+        Type::Path(tp) => tp,
+        Type::Reference(r) => return option_inner(&r.elem),
+        Type::Paren(p) => return option_inner(&p.elem),
+        Type::Group(g) => return option_inner(&g.elem),
+        _ => return None,
+    };
     let last = tp.path.segments.last()?;
     (last.ident == "Option").then(|| first_type_arg(last))
 }

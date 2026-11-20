@@ -109,6 +109,29 @@ mod macro_integration {
         value
     }
 
+    /// Delete nothing
+    #[claude_tool]
+    async fn unit_ok(filter: &Option<String>) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Pass a ToolResult through a Result
+    #[claude_tool]
+    async fn wrapped_result() -> Result<claude_code_agent::ToolResult, String> {
+        Ok(claude_code_agent::ToolResult::text("wrapped"))
+    }
+
+    #[tokio::test]
+    async fn result_ok_value_converts_by_its_own_type() {
+        let server = claude_code_agent::SdkMcpServer::new("t").tool(unit_ok_tool()).tool(wrapped_result_tool());
+        let unit = call(&server, "unit_ok", serde_json::json!({})).await;
+        assert_eq!(unit["content"][0]["text"], "ok");
+        let wrapped = call(&server, "wrapped_result", serde_json::json!({})).await;
+        assert_eq!(wrapped["content"][0]["text"], "wrapped");
+        let schema = unit_ok_tool_def().input_schema.unwrap();
+        assert_eq!(schema["required"], serde_json::json!([]), "`&Option<T>` is not required");
+    }
+
     #[tokio::test]
     async fn alias_result_err_is_an_error_result() {
         let server = claude_code_agent::SdkMcpServer::new("t").tool(always_fails_tool());

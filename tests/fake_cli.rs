@@ -2,7 +2,11 @@
 //! CLI: this executable doubles as the fake one (`ROLE` picks what it does).
 //!
 //! - `close()` ends the CLI, a child in its group, and (Unix) a child in a
-//!   process group of its own, as the real CLI starts hooks and Bash tools.
+//!   process group of its own, as the real CLI starts hooks and Bash tools,
+//!   both when the CLI outlives stdin EOF and when it exits on it. A line
+//!   that is not UTF-8 does not stop the reader; requests after `close()`
+//!   fail with `Closed`.
+//! - One `result` answering two merged prompts ends both turns.
 //! - Two sessions sharing an `SdkMcpServer` cancel only their own calls,
 //!   and tool handlers see their session's id.
 //! - A prompt dropped before it is written does not leave `is_busy()` set,
@@ -24,7 +28,9 @@ const WHO: &str = "CLAUDE_SDK_TEST_WHO";
 
 fn main() {
     match std::env::var(ROLE).as_deref() {
-        Ok("cli") => tree_cli(),
+        Ok("cli") => tree_cli(true),
+        Ok("eof_cli") => tree_cli(false),
+        Ok("merged_cli") => merged_cli(),
         Ok("mcp_cli") => mcp_cli(),
         Ok("hung_cli") => {
             handshake();
@@ -34,7 +40,9 @@ fn main() {
         Ok("sleeper") => std::thread::sleep(Duration::from_secs(600)),
         _ => {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(close_ends_process_tree());
+            rt.block_on(close_ends_process_tree("cli"));
+            rt.block_on(close_ends_process_tree("eof_cli"));
+            rt.block_on(merged_prompts_end_together());
             rt.block_on(mcp_cancel_stays_in_its_session());
             rt.block_on(hung_cli_does_not_wedge_the_session());
             rt.block_on(exit_fails_requests_while_stdout_is_held());
@@ -81,8 +89,9 @@ fn sleeper() -> std::process::Command {
 }
 
 /// Start a child in the CLI's group and (Unix) one in a group of its own,
-/// write their pids, answer control requests, then outlive stdin EOF.
-fn tree_cli() {
+/// write their pids, write a line that is not UTF-8, answer control
+/// requests, then on stdin EOF wait for the children (`outlive_eof`) or exit.
+fn tree_cli(outlive_eof: bool) {
     let mut children = vec![sleeper().spawn().unwrap()];
     #[cfg(unix)]
     {
@@ -91,16 +100,45 @@ fn tree_cli() {
     }
     let pids: Vec<String> = children.iter().map(|c| c.id().to_string()).collect();
     std::fs::write(std::env::var(PID_FILE).unwrap(), pids.join(" ")).unwrap();
+    for out in [&mut std::io::stdout() as &mut dyn Write, &mut std::io::stderr()] {
+        out.write_all(b"\xff\xfe not utf-8\n").unwrap();
+        out.flush().unwrap();
+    }
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
         answer(&line);
     }
-    for child in &mut children {
-        let _ = child.wait();
+    if outlive_eof {
+        for child in &mut children {
+            let _ = child.wait();
+        }
     }
 }
 
+/// Take two prompts, then end both with one `result`, as the CLI does when
+/// it merges prompts sent close together into one turn.
+fn merged_cli() {
+    handshake();
+    let mut uuids = vec![];
+    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+        let msg: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        if msg["type"] == "user" {
+            uuids.push(msg["uuid"].clone());
+        }
+        if uuids.len() == 2 {
+            break;
+        }
+    }
+    for uuid in &uuids {
+        emit(&serde_json::json!({ "type": "user", "isReplay": true, "uuid": uuid,
+            "message": { "role": "user", "content": "hi" } }));
+    }
+    emit(&serde_json::json!({ "type": "result", "subtype": "success", "is_error": false,
+        "user_message_uuids": uuids }));
+    for _ in std::io::stdin().lock().lines().map_while(Result::ok) {}
+}
+
 /// Session `sess-<WHO>` calls tool `slow` with JSON-RPC id 0 (as every CLI's
-/// first call is); session A then cancels its request 0.
+/// first call is); session A cancels its request 0 right after.
 fn mcp_cli() {
     handshake();
     let who = std::env::var(WHO).unwrap();
@@ -112,7 +150,6 @@ fn mcp_cli() {
     emit(&mcp("m1", serde_json::json!({ "jsonrpc": "2.0", "id": 0, "method": "tools/call",
         "params": { "name": "slow", "arguments": { "who": who } } })));
     if who == "A" {
-        std::thread::sleep(Duration::from_millis(300));
         emit(&mcp("m2", serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
             "params": { "requestId": 0 } })));
     }
@@ -141,9 +178,9 @@ fn pid_file(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("claude-code-agent-{name}-{}.pid", std::process::id()))
 }
 
-async fn close_ends_process_tree() {
-    let file = pid_file("tree");
-    let session = Session::spawn(opts("cli", &[(PID_FILE, file.display().to_string())]), Initialize::default())
+async fn close_ends_process_tree(role: &str) {
+    let file = pid_file(role);
+    let session = Session::spawn(opts(role, &[(PID_FILE, file.display().to_string())]), Initialize::default())
         .await
         .expect("spawn fake cli");
     let cli_pid = session.pid().expect("cli pid");
@@ -154,10 +191,36 @@ async fn close_ends_process_tree() {
     let mut all = children.clone();
     all.push(cli_pid);
     assert!(all.iter().all(|&p| alive(p)), "processes did not start");
+    session.interrupt().await.expect("the reader outlives a line that is not UTF-8");
     session.close().await;
     let _ = std::fs::remove_file(&file);
     wait_for(|| all.iter().all(|&p| !alive(p)).then_some(()));
-    println!("fake_cli: close() ended the CLI ({cli_pid}) and its children {children:?}");
+    let after = session.interrupt().await;
+    assert!(matches!(after, Err(SessionError::Closed)), "got {after:?}");
+    println!("fake_cli ({role}): close() ended the CLI ({cli_pid}) and its children {children:?}");
+}
+
+async fn merged_prompts_end_together() {
+    let session = Session::spawn(opts("merged_cli", &[]), Initialize::default()).await.expect("spawn merged cli");
+    let agent = Agent::new(session.clone());
+    let streams = [agent.prompt("a").await.expect("send a"), agent.prompt("b").await.expect("send b")];
+    for mut stream in streams {
+        let end = tokio::time::timeout(Duration::from_secs(5), async {
+            use tokio_stream::StreamExt;
+            while let Some(ev) = stream.next().await {
+                if matches!(ev, claude_code_agent::AgentEvent::Done(_) | claude_code_agent::AgentEvent::Error(_)) {
+                    return Some(ev);
+                }
+            }
+            None
+        })
+        .await
+        .expect("merged turn must end");
+        assert!(matches!(end, Some(claude_code_agent::AgentEvent::Done(_))), "got {end:?}");
+    }
+    assert!(!session.is_busy(), "one result answering two prompts must end both");
+    session.close().await;
+    println!("fake_cli: one result for two merged prompts ends both and leaves is_busy() false");
 }
 
 async fn mcp_cancel_stays_in_its_session() {

@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-agent"
-version = "0.7.1"
+version = "0.8.0"
 rust-version = "1.88"
 edition = "2024"
 description = "Rust SDK for Claude Code — persistent subprocess, hook callbacks, in-process tools, record/replay"
@@ -26,7 +26,8 @@ thiserror    = "2"
 tracing      = "0.1"
 dashmap      = "6"
 
-claude-code-agent-macros      = { version = "0.7.1", path = "claude-code-agent-macros", optional = true }
+# Exact: generated code calls this crate's `__private` items of the same release.
+claude-code-agent-macros      = { version = "=0.8.0", path = "claude-code-agent-macros", optional = true }
 
 tokio-stream = "0.1.19"
 async-stream = "0.3.6"
@@ -36,11 +37,14 @@ regex = { version = "1.13.2", default-features = false, features = ["std", "perf
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.32.0", features = ["signal", "user"] }
 
+[target.'cfg(windows)'.dependencies]
+win32job = "2.1"
+
 [dev-dependencies]
 tokio             = { version = "1", features = ["full"] }
 anyhow            = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-claude-code-agent-macros = { version = "0.7.1", path = "claude-code-agent-macros" }
+claude-code-agent-macros = { version = "=0.8.0", path = "claude-code-agent-macros" }
 
 [[example]]
 name = "tools"

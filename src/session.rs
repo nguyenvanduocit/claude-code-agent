@@ -16,7 +16,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::hooks::HookRegistry;
-use crate::mcp::{server_map, SdkMcpServer};
+use crate::mcp::{server_map, CallRegistration, SdkMcpServer};
 use crate::protocol::{
     Autocompact, CanUseToolRequest, ControlRequest, ControlRequestBody, ControlResponse, Effort,
     ElicitationRequest, ElicitationResponse, InboundControlResponseBody, InboundMessage, Initialize,
@@ -463,6 +463,9 @@ pub(crate) struct Transport {
     /// Unix: process group of the CLI and everything it started (Bash
     /// tools, …). Windows: the CLI's pid, root of its process tree.
     pub(crate) pgid: Option<i32>,
+    /// Windows: a job holding the CLI and every process it starts.
+    #[cfg(windows)]
+    pub(crate) job: Option<win32job::Job>,
 }
 
 /// A live Claude Code session. Cheap to clone — backed by `Arc<SessionInner>`.
@@ -509,12 +512,17 @@ struct SessionInner {
     cli_version: OnceLock<String>,
     control_timeout: Duration,
     responder: Arc<Responder>,
-    /// Prompts sent whose `result` has not arrived yet.
-    turns_in_flight: Arc<AtomicUsize>,
+    /// Prompts sent whose turn has not ended yet.
+    prompts: Arc<PromptsInFlight>,
     /// `true` once the reader has handled the last stdout line.
     reader_done: watch::Receiver<bool>,
+    /// The host called `close()`: errors read `Closed`, not `ProcessExited`.
+    closed: AtomicBool,
     /// `close()` has ended the CLI and what it started; `Drop` skips it.
     group_ended: AtomicBool,
+    /// Windows: dropping it ends every process in it; `None` once ended.
+    #[cfg(windows)]
+    job: std::sync::Mutex<Option<win32job::Job>>,
     _tasks: [JoinHandle<()>; 3],
 }
 
@@ -630,6 +638,8 @@ impl Session {
         let record = open_record(&opts).await?;
         let mut child = cmd.spawn()?;
         let pgid = child.id().and_then(|id| i32::try_from(id).ok());
+        #[cfg(windows)]
+        let job = child.raw_handle().and_then(job_for);
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -646,8 +656,15 @@ impl Session {
             }
             Vec::from(std::mem::take(&mut *lock(&tail))).join("\n")
         });
-        let transport =
-            Transport { stdin: Box::new(stdin), stdout: Box::new(stdout), exit, stderr_tail, pgid };
+        let transport = Transport {
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            exit,
+            stderr_tail,
+            pgid,
+            #[cfg(windows)]
+            job,
+        };
         Self::connect(transport, opts, init, record).await
     }
 
@@ -659,7 +676,15 @@ impl Session {
         mut init: Initialize,
         record: Option<tokio::fs::File>,
     ) -> Result<Self> {
-        let Transport { stdin, stdout, exit: exit_fut, stderr_tail, pgid } = transport;
+        let Transport {
+            stdin,
+            stdout,
+            exit: exit_fut,
+            stderr_tail,
+            pgid,
+            #[cfg(windows)]
+            job,
+        } = transport;
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(256);
         let fanout = Arc::new(std::sync::Mutex::new(Fanout::default()));
         let session_id = Arc::new(RwLock::new(None));
@@ -667,7 +692,7 @@ impl Session {
         let state = Arc::new(AtomicU8::new(STATE_RUNNING));
         let (exit_tx, exit_rx) = watch::channel(None);
         let (reader_done_tx, reader_done) = watch::channel(false);
-        let turns_in_flight = Arc::new(AtomicUsize::new(0));
+        let prompts = Arc::new(PromptsInFlight::default());
 
         let writer = tokio::spawn(async move {
             let mut w = BufWriter::new(stdin);
@@ -707,7 +732,7 @@ impl Session {
             fanout: fanout.clone(),
             session_id: session_id.clone(),
             pending: pending.clone(),
-            turns_in_flight: turns_in_flight.clone(),
+            prompts: prompts.clone(),
             responder: responder.clone(),
             done: reader_done_tx,
         }));
@@ -726,9 +751,12 @@ impl Session {
             cli_version: OnceLock::new(),
             control_timeout: opts.control_timeout,
             responder,
-            turns_in_flight,
+            prompts,
             reader_done,
+            closed: AtomicBool::new(false),
             group_ended: AtomicBool::new(false),
+            #[cfg(windows)]
+            job: std::sync::Mutex::new(job),
             _tasks: [reader, writer, watchdog],
         }));
 
@@ -799,9 +827,9 @@ impl Session {
         detached(async move {
             let reply = session.control(&serde_json::json!({ "subtype": "interrupt", "cancel_queued": true })).await?;
             // Cancelled prompts get no `result`.
-            let cancelled = reply.get("cancelled").and_then(|c| c.as_array()).map_or(0, Vec::len);
-            for _ in 0..cancelled {
-                decrement(&session.0.turns_in_flight);
+            let cancelled = reply.get("cancelled").and_then(|c| c.as_array()).into_iter().flatten();
+            for uuid in cancelled.filter_map(serde_json::Value::as_str) {
+                session.0.prompts.remove(uuid);
             }
             Ok(())
         })
@@ -895,12 +923,12 @@ impl Session {
         let message_uuid = uuid.to_owned();
         let dropped = detached(async move {
             let reply = session
-                .control(&serde_json::json!({ "subtype": "cancel_async_message", "message_uuid": message_uuid }))
+                .control(&serde_json::json!({ "subtype": "cancel_async_message", "message_uuid": &message_uuid }))
                 .await?;
             let dropped = reply.get("cancelled").and_then(serde_json::Value::as_bool) == Some(true);
             if dropped {
                 // No `result` will come for it.
-                decrement(&session.0.turns_in_flight);
+                session.0.prompts.remove(&message_uuid);
             }
             Ok(dropped)
         })
@@ -956,9 +984,32 @@ impl Session {
         external: serde_json::Map<String, serde_json::Value>,
     ) -> Result<serde_json::Value> {
         let servers = server_map(&sdk, Some(&external));
-        *self.0.responder.dynamic_mcp_servers.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            sdk.iter().map(SdkMcpServer::for_session).collect();
-        self.control(&serde_json::json!({ "subtype": "mcp_set_servers", "servers": servers })).await
+        let dynamic = &self.0.responder.dynamic_mcp_servers;
+        let write = || dynamic.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (previous, next) = {
+            let mut current = write();
+            // A server the CLI keeps keeps its running calls cancellable.
+            let next: Vec<SdkMcpServer> = sdk
+                .iter()
+                .map(|s| match current.iter().find(|c| c.name == s.name) {
+                    Some(running) => s.taking_over(running),
+                    None => s.for_session(),
+                })
+                .collect();
+            // Both answer while the CLI switches: it may reach the new
+            // servers before it replies, and keeps the old ones if it refuses.
+            let mut both = next.clone();
+            both.extend(current.iter().filter(|c| !next.iter().any(|n| n.name == c.name)).cloned());
+            (std::mem::replace(&mut *current, both), next)
+        };
+        let reply = self.control(&serde_json::json!({ "subtype": "mcp_set_servers", "servers": servers })).await;
+        match &reply {
+            Ok(_) => *write() = next,
+            Err(SessionError::ControlError { .. }) => *write() = previous,
+            // Unknown whether the CLI switched: both keep answering.
+            Err(_) => {}
+        }
+        reply
     }
 
     /// Models the session can switch to. Source: binary `list_models` schema
@@ -1142,6 +1193,23 @@ impl Session {
         self.0.initialize_response.get()
     }
 
+    /// Whether the CLI offers slash command `/<name>`; none does with
+    /// `SessionOptions::disable_slash_commands`. A CLI that sent no command
+    /// list counts as offering it.
+    pub(crate) fn offers_command(&self, name: &str) -> bool {
+        match self.initialize_response().and_then(|r| r.get("commands")).and_then(|c| c.as_array()) {
+            Some(commands) => commands.iter().any(|c| c.get("name").and_then(|n| n.as_str()) == Some(name)),
+            None => true,
+        }
+    }
+
+    /// The permission mode the session started in: `--permission-mode`,
+    /// else the settings' `permissions.defaultMode`.
+    pub(crate) fn launch_permission_mode(&self) -> Option<PermissionMode> {
+        let mode = self.initialize_response()?.get("current_permission_mode")?.clone();
+        serde_json::from_value(mode).ok()
+    }
+
     /// Whether the session streams partial messages
     /// (`SessionOptions::include_partial`).
     #[must_use]
@@ -1152,16 +1220,16 @@ impl Session {
     /// Whether a prompt sent with `Agent` is still waiting for its `result`.
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        self.0.turns_in_flight.load(Ordering::Acquire) > 0
+        !self.0.prompts.is_empty()
     }
 
-    /// Send a prompt and count it as in flight until its `result`. Counted
+    /// Send a prompt and count it as in flight until its turn ends. Counted
     /// before the write, so a fast `result` cannot arrive first.
     pub(crate) async fn send_prompt(&self, message: &crate::protocol::UserMessage) -> Result<()> {
-        self.0.turns_in_flight.fetch_add(1, Ordering::AcqRel);
+        self.0.prompts.add(&message.uuid);
         // Uncounts on error and when the caller drops this future before
         // the prompt is queued (a dropped channel send sends nothing).
-        let mut counted = UnsentTurn(Some(&self.0.turns_in_flight));
+        let mut counted = UnsentPrompt(Some((&self.0.prompts, &message.uuid)));
         self.send(message).await?;
         counted.0 = None;
         Ok(())
@@ -1177,16 +1245,33 @@ impl Session {
     /// SIGTERM, then SIGKILL its process group. Hooks and Bash tools still
     /// running (the CLI starts each in a process group of its own) end with
     /// it: SIGTERM, then SIGKILL after 2 s. A process a hook or tool detached
-    /// that outlived it (`(cmd &)`, `nohup cmd &`) is out of reach.
+    /// that outlived it (`(cmd &)`, `nohup cmd &`) is out of reach. On
+    /// Windows the CLI and everything it started end with its job object.
+    /// Completes even if this future is dropped; requests made after it fail
+    /// with `SessionError::Closed`.
     /// Returns the CLI's exit code (`None` when it ended by a signal).
     pub async fn close(&self) -> Option<i32> {
+        // In its own task, so the teardown completes even when the caller
+        // drops this future: a hook or tool handler calling close() is
+        // aborted with the other handlers once the CLI exits.
+        let session = self.clone();
+        tokio::spawn(async move { session.close_here().await }).await.unwrap_or(None)
+    }
+
+    async fn close_here(&self) -> Option<i32> {
+        self.0.closed.store(true, Ordering::Release);
+        let _ = self.0.state.compare_exchange(STATE_RUNNING, STATE_CLOSING, Ordering::SeqCst, Ordering::SeqCst);
         #[cfg(unix)]
         let pgid = self.0.pgid;
-        let _ = self.0.state.compare_exchange(STATE_RUNNING, STATE_CLOSING, Ordering::SeqCst, Ordering::SeqCst);
         // Before stdin closes: once the CLI exits, its tools lose the parent
-        // link that finds them.
+        // link that finds them. Not for a CLI already reaped: its pid may
+        // belong to another process by now.
         #[cfg(unix)]
-        let mut groups = blocking(move || tool_groups(pgid)).await;
+        let mut groups = if self.0.state.load(Ordering::Acquire) == STATE_DEAD {
+            vec![]
+        } else {
+            blocking(move || tool_groups(pgid)).await
+        };
         self.0.stdin_tx.lock().await.take();
         let mut exit = self.wait_exit(CLOSE_GRACE).await;
         #[cfg(unix)]
@@ -1209,10 +1294,18 @@ impl Session {
             groups.extend(pgid);
             blocking(move || end_groups(&groups)).await;
         }
-        #[cfg(not(unix))]
-        if exit.is_none() {
-            kill_tree(self.0.pgid);
-            exit = self.wait_exit(CLOSE_GRACE).await;
+        // The job holds the CLI, if still running, and what it left running.
+        #[cfg(windows)]
+        {
+            let job = lock(&self.0.job).take();
+            if job.is_none() && exit.is_none() {
+                let pid = self.0.pgid;
+                blocking(move || kill_tree(pid)).await;
+            }
+            drop(job);
+            if exit.is_none() {
+                exit = self.wait_exit(CLOSE_GRACE).await;
+            }
         }
         self.0.group_ended.store(true, Ordering::Release);
         // Let the reader finish the last lines (and the recording).
@@ -1287,7 +1380,7 @@ impl Session {
 
     /// Error describing why the process is gone, with its stderr tail.
     async fn dead_error(&self) -> SessionError {
-        if self.0.state.load(Ordering::Acquire) == STATE_CLOSING {
+        if self.0.closed.load(Ordering::Acquire) {
             return SessionError::Closed;
         }
         // The watchdog records the exit right after stdout/stderr close.
@@ -1316,7 +1409,10 @@ impl Drop for SessionInner {
     /// groups, then from a cleanup thread SIGKILL to whatever is left after
     /// the grace periods. The thread needs no Tokio runtime. The CLI's group
     /// is signalled even when the CLI already died, for the children it left
-    /// (MCP servers).
+    /// (MCP servers). Reading the process table blocks this thread (`ps` on
+    /// macOS): the CLI must not get SIGTERM before its tools are found, and
+    /// a host exiting right after the drop would end a thread doing it.
+    /// Windows: the job (a field) ends what is in it when dropped.
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid
@@ -1348,21 +1444,62 @@ impl Drop for SessionInner {
                 tracing::warn!(error = %e, "could not start the session cleanup thread");
             }
         }
-        #[cfg(not(unix))]
-        if !self.group_ended.load(Ordering::Acquire) && self.state.load(Ordering::Acquire) != STATE_DEAD {
-            kill_tree(self.pgid);
+        // Windows: dropping the job (a field) ends what is in it.
+        #[cfg(windows)]
+        if lock(&self.job).is_none()
+            && !self.group_ended.load(Ordering::Acquire)
+            && self.state.load(Ordering::Acquire) != STATE_DEAD
+        {
+            let pid = self.pgid;
+            if let Err(e) = std::thread::Builder::new().name("claude-session-cleanup".into()).spawn(move || kill_tree(pid)) {
+                tracing::warn!(error = %e, "could not start the session cleanup thread");
+            }
         }
     }
 }
 
-/// Decrements the in-flight turn count when dropped while still holding it.
-struct UnsentTurn<'a>(Option<&'a AtomicUsize>);
+/// Removes a prompt from the in-flight set when dropped while still holding it.
+struct UnsentPrompt<'a>(Option<(&'a PromptsInFlight, &'a str)>);
 
-impl Drop for UnsentTurn<'_> {
+impl Drop for UnsentPrompt<'_> {
     fn drop(&mut self) {
-        if let Some(n) = self.0 {
-            decrement(n);
+        if let Some((prompts, uuid)) = self.0 {
+            prompts.remove(uuid);
         }
+    }
+}
+
+/// Prompts sent with `Agent` whose turn has not ended, oldest first.
+#[derive(Default)]
+struct PromptsInFlight(std::sync::Mutex<Vec<String>>);
+
+impl PromptsInFlight {
+    fn add(&self, uuid: &str) {
+        lock(&self.0).push(uuid.to_owned());
+    }
+
+    fn remove(&self, uuid: &str) {
+        lock(&self.0).retain(|u| !u.eq_ignore_ascii_case(uuid));
+    }
+
+    /// A turn ended with `result`. It names the prompts it answered (several
+    /// when the CLI merged them into one turn); one that names none and was
+    /// not started by the CLI itself answered the oldest.
+    fn end_turn(&self, result: &ResultMessage) {
+        let mut prompts = lock(&self.0);
+        if !result.user_message_uuids.is_empty() {
+            prompts.retain(|u| !result.answers(u));
+        } else if result.origin.is_none() && !prompts.is_empty() {
+            prompts.remove(0);
+        }
+    }
+
+    fn clear(&self) {
+        lock(&self.0).clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        lock(&self.0).is_empty()
     }
 }
 
@@ -1375,7 +1512,6 @@ async fn detached<T: Send + 'static>(work: impl Future<Output = Result<T>> + Sen
 }
 
 /// Run blocking `work` off the async threads.
-#[cfg(unix)]
 async fn blocking<T: Default + Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     tokio::task::spawn_blocking(work).await.unwrap_or_default()
 }
@@ -1438,7 +1574,7 @@ async fn drain_stderr(
     on_stderr: Option<OnStderr>,
     tail: Arc<std::sync::Mutex<VecDeque<String>>>,
 ) {
-    let mut lines = BufReader::new(stderr).lines();
+    let mut lines = LossyLines::new(stderr);
     while let Ok(Some(line)) = lines.next_line().await {
         if let Some(cb) = &on_stderr
             && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (cb.0)(&line))).is_err()
@@ -1453,7 +1589,23 @@ async fn drain_stderr(
     }
 }
 
-/// End the CLI and every process it started (Windows has no process groups).
+/// A job holding `process` that ends what is in it when dropped; `None`
+/// if Windows refuses (the CLI then ends with `kill_tree`).
+#[cfg(windows)]
+fn job_for(process: std::os::windows::io::RawHandle) -> Option<win32job::Job> {
+    let mut limits = win32job::ExtendedLimitInfo::new();
+    limits.limit_kill_on_job_close();
+    let job = win32job::Job::create_with_limit_info(&limits)
+        .inspect_err(|e| tracing::warn!(error = %e, "could not create a job for the CLI"))
+        .ok()?;
+    job.assign_process(process as isize)
+        .inspect_err(|e| tracing::warn!(error = %e, "could not put the CLI in a job"))
+        .ok()?;
+    Some(job)
+}
+
+/// End the CLI and every process it started that is still its descendant
+/// (Windows has no process groups). Blocking.
 #[cfg(not(unix))]
 fn kill_tree(pid: Option<i32>) {
     if let Some(pid) = pid {
@@ -1557,15 +1709,13 @@ fn version_lt(a: &str, b: &str) -> bool {
     parse(a) < parse(b)
 }
 
-/// Decrement, stopping at zero.
-fn decrement(n: &AtomicUsize) {
-    let mut current = n.load(Ordering::Acquire);
-    while current > 0 {
-        match n.compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => break,
-            Err(actual) => current = actual,
-        }
-    }
+/// The prompt a `command_lifecycle` "cancelled" frame withdraws: it was
+/// dropped from the queue before it ran, so no `result` will come for it.
+pub(crate) fn cancelled_prompt(frame: &serde_json::Value) -> Option<&str> {
+    let field = |k: &str| frame.get(k).and_then(|v| v.as_str());
+    (field("type") == Some("command_lifecycle") && field("state") == Some("cancelled"))
+        .then(|| field("command_uuid"))
+        .flatten()
 }
 
 /// The file `SessionOptions::record` names, created (truncated) for writing.
@@ -1609,6 +1759,43 @@ fn with_subtype(mut body: serde_json::Value, subtype: &str) -> serde_json::Value
     body
 }
 
+/// Lines of a byte stream. Unlike `Lines`, a line that is not UTF-8 is
+/// decoded lossily instead of ending the stream: a tool the CLI started can
+/// write any bytes to an inherited stderr.
+struct LossyLines<R> {
+    inner: BufReader<R>,
+    /// The line read so far; kept across a cancelled `next_line`.
+    line: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> LossyLines<R> {
+    fn new(inner: R) -> Self {
+        Self { inner: BufReader::new(inner), line: vec![] }
+    }
+
+    /// The next line without its `\n` / `\r\n`; `None` at EOF. Cancel safe:
+    /// bytes of a partly read line stay in `self.line`.
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        let n = self.inner.read_until(b'\n', &mut self.line).await?;
+        if n == 0 && self.line.is_empty() {
+            return Ok(None);
+        }
+        let mut line = std::mem::take(&mut self.line);
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        Ok(Some(String::from_utf8(line).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())))
+    }
+
+    /// Whether no read bytes are waiting in the buffer.
+    fn buffered_is_empty(&self) -> bool {
+        self.inner.buffer().is_empty()
+    }
+}
+
 /// State the reader task shares with the Session.
 struct Reader {
     record: Option<tokio::fs::File>,
@@ -1618,23 +1805,23 @@ struct Reader {
     fanout: Arc<std::sync::Mutex<Fanout>>,
     session_id: Arc<RwLock<Option<String>>>,
     pending: Arc<Pending>,
-    turns_in_flight: Arc<AtomicUsize>,
+    prompts: Arc<PromptsInFlight>,
     responder: Arc<Responder>,
     done: watch::Sender<bool>,
 }
 
 async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
-    let Reader { record, mut exit, fanout, session_id, pending, turns_in_flight, responder, done } = reader;
+    let Reader { record, mut exit, fanout, session_id, pending, prompts, responder, done } = reader;
     // Runs on EOF and on a panic alike, so streams and waiters never hang.
     let cleanup = ReaderCleanup {
         fanout: fanout.clone(),
         pending,
-        turns_in_flight: turns_in_flight.clone(),
+        prompts: prompts.clone(),
         responder: responder.clone(),
         done,
     };
     let mut record = record.map(BufWriter::new);
-    let mut lines = BufReader::new(stdout).lines();
+    let mut lines = LossyLines::new(stdout);
     let mut exited = false;
     loop {
         // `next_line` is cancel safe: a partly read line stays buffered.
@@ -1662,7 +1849,7 @@ async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
         if let Some(file) = record.as_mut() {
             // Flush once a burst is drained, not per line: a slow disk must
             // not hold up stdout, and the file stays current while idle.
-            let flush = lines.get_ref().buffer().is_empty();
+            let flush = lines.buffered_is_empty();
             if file.write_all(line.as_bytes()).await.is_err()
                 || file.write_all(b"\n").await.is_err()
                 || (flush && file.flush().await.is_err())
@@ -1684,8 +1871,12 @@ async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
                 // waiting. Its abort handle is registered before the next
                 // line is read, so a `control_cancel_request` always finds it.
                 let request_id = req.request_id.clone();
+                // Before the task starts: a `tools/call` is registered for
+                // cancellation now, so a `notifications/cancelled` on a later
+                // line always finds it.
+                let mcp = responder.mcp_target(&req);
                 let handler = responder.clone();
-                let task = tokio::spawn(async move { handler.respond(req).await });
+                let task = tokio::spawn(async move { handler.respond(req, mcp).await });
                 responder.in_flight.insert(request_id.clone(), task.abort_handle());
                 let responder = responder.clone();
                 tokio::spawn(async move {
@@ -1706,10 +1897,14 @@ async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
                 }
             }
             other => {
-                if let InboundMessage::Result(ref r) = other
-                    && r.origin.is_none()
-                {
-                    decrement(&turns_in_flight);
+                match &other {
+                    InboundMessage::Result(r) => prompts.end_turn(r),
+                    InboundMessage::Other(frame) => {
+                        if let Some(uuid) = cancelled_prompt(frame) {
+                            prompts.remove(uuid);
+                        }
+                    }
+                    _ => {}
                 }
                 if let InboundMessage::System(ref s) = other {
                     let mut id = session_id.write().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1733,7 +1928,7 @@ async fn read_loop(stdout: Box<dyn AsyncRead + Unpin + Send>, reader: Reader) {
 struct ReaderCleanup {
     fanout: Arc<std::sync::Mutex<Fanout>>,
     pending: Arc<Pending>,
-    turns_in_flight: Arc<AtomicUsize>,
+    prompts: Arc<PromptsInFlight>,
     responder: Arc<Responder>,
     done: watch::Sender<bool>,
 }
@@ -1746,7 +1941,7 @@ impl Drop for ReaderCleanup {
             f.subs.clear();
         }
         self.pending.clear();
-        self.turns_in_flight.store(0, Ordering::Release);
+        self.prompts.clear();
         // Handlers still waiting (a permission prompt, an elicitation) have
         // no CLI left to answer.
         self.responder.in_flight.retain(|_, task| {
@@ -1778,7 +1973,17 @@ fn parse_frame(line: &str) -> InboundMessage {
                     is_error: value.as_ref().and_then(|v| v.get("is_error")).and_then(serde_json::Value::as_bool).unwrap_or(false),
                     result: field("result"),
                     session_id: field("session_id"),
-                    origin: value.as_ref().and_then(|v| v.get("origin")).cloned(),
+                    // `null` is no origin, as in the typed decode.
+                    origin: value.as_ref().and_then(|v| v.get("origin")).filter(|o| !o.is_null()).cloned(),
+                    // Ends the stream of a prompt refused before it ran.
+                    user_message_uuids: value
+                        .as_ref()
+                        .and_then(|v| v.get("user_message_uuids"))
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|u| u.as_str().map(str::to_owned))
+                        .collect(),
                     ..ResultMessage::default()
                 })
             } else if let (Some("control_request"), Some(request_id)) = (field("type").as_deref(), value.as_ref().and_then(|v| v.get("request_id")).and_then(|v| v.as_str())) {
@@ -1801,8 +2006,25 @@ fn parse_frame(line: &str) -> InboundMessage {
     }
 }
 
+/// The in-process server an `mcp_message` is for, and the registration of
+/// its `tools/call`.
+type McpTarget = (SdkMcpServer, Option<CallRegistration>);
+
 impl Responder {
-    async fn respond(&self, req: ControlRequest) -> ControlResponse {
+    /// The server an `mcp_message` request is for, with its `tools/call`
+    /// registered for cancellation; `None` for any other request or an
+    /// unknown server.
+    fn mcp_target(&self, req: &ControlRequest) -> Option<McpTarget> {
+        let ControlRequestBody::McpMessage(m) = &req.request else { return None };
+        let server = self.mcp_servers.iter().find(|s| s.name == m.server_name).cloned().or_else(|| {
+            let dynamic = self.dynamic_mcp_servers.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            dynamic.iter().find(|s| s.name == m.server_name).cloned()
+        })?;
+        let registration = server.register_call(&m.message);
+        Some((server, registration))
+    }
+
+    async fn respond(&self, req: ControlRequest, mcp: Option<McpTarget>) -> ControlResponse {
         match req.request {
             ControlRequestBody::HookCallback(hcb) => {
                 let span = tracing::info_span!(
@@ -1852,14 +2074,10 @@ impl Responder {
                     method = m.message.get("method").and_then(|v| v.as_str()).unwrap_or(""),
                     tool = m.message.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or(""),
                 );
-                let server = self.mcp_servers.iter().find(|s| s.name == m.server_name).cloned().or_else(|| {
-                    let dynamic = self.dynamic_mcp_servers.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    dynamic.iter().find(|s| s.name == m.server_name).cloned()
-                });
-                let reply = match server {
-                    Some(server) => {
+                let reply = match mcp {
+                    Some((server, registration)) => {
                         let session_id = self.session_id.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-                        server.handle_in_session(&m.message, session_id).instrument(span).await
+                        server.handle_in_session(&m.message, session_id, registration).instrument(span).await
                     }
                     None => serde_json::json!({
                         "jsonrpc": "2.0",

@@ -19,6 +19,7 @@ const RECORDING: &str = r#"{"type":"control_response","response":{"subtype":"suc
 {"type":"system","subtype":"compact_boundary","session_id":"s1","compact_metadata":{"trigger":"manual","pre_tokens":900}}
 {"type":"user","isReplay":true,"uuid":"rec-3","message":{"role":"user","content":"/compact"},"session_id":"s1"}
 {"type":"result","subtype":"success","session_id":"s1","total_cost_usd":0.4}
+{"type":"result","subtype":"error_max_budget_usd","is_error":true,"session_id":"s1","user_message_uuids":["rec-4"]}
 "#;
 
 async fn turn(agent: &Agent, prompt: &str) -> (String, TurnResult) {
@@ -38,7 +39,7 @@ async fn turn(agent: &Agent, prompt: &str) -> (String, TurnResult) {
 #[test]
 fn cli_started_turn_stays_with_next_prompted_turn() {
     let rec = Recording::parse(RECORDING).expect("parse");
-    assert_eq!(rec.turns.len(), 3);
+    assert_eq!(rec.turns.len(), 4);
     assert_eq!(rec.initialize_response["pid"], 1);
 }
 
@@ -69,5 +70,20 @@ async fn prompt_stream_holds_only_its_own_turn() {
         }
     }
     assert_eq!(compacted, Some(("manual".to_string(), Some(900))));
+
+    // Refused before it ran: no echo, only the result names the prompt.
+    let mut stream = agent.prompt("over budget").await.expect("send");
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Done(_) | AgentEvent::Error(_) = ev {
+                return Some(ev);
+            }
+        }
+        None
+    })
+    .await
+    .expect("a refused prompt's stream must end");
+    assert!(matches!(end, Some(AgentEvent::Error(_))), "got {end:?}");
+    assert!(!agent.session().is_busy());
     let _ = std::fs::remove_file(&path);
 }

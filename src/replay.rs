@@ -81,7 +81,15 @@ pub async fn replay(path: impl AsRef<Path>, opts: SessionOptions) -> Result<Sess
     let exit = Box::pin(async move { fake.await.ok().map(|()| 0) });
     let stderr_tail = Box::pin(async { String::new() });
     let transport =
-        Transport { stdin: Box::new(host_in), stdout: Box::new(host_out), exit, stderr_tail, pgid: None };
+        Transport {
+            stdin: Box::new(host_in),
+            stdout: Box::new(host_out),
+            exit,
+            stderr_tail,
+            pgid: None,
+            #[cfg(windows)]
+            job: None,
+        };
     Session::connect(transport, opts, Initialize::default(), record).await
 }
 
@@ -110,10 +118,11 @@ async fn fake_cli(io: tokio::io::DuplexStream, recording: Recording) {
                         "subtype": "error_during_execution",
                         "is_error": true,
                         "errors": ["replay exhausted: no recorded turn left"],
+                        "user_message_uuids": [msg["uuid"]],
                     })
                     .to_string(),
                 ]
-            }, |frames| with_echo_uuid(frames, &msg["uuid"])),
+            }, |frames| for_prompt(frames, &msg["uuid"])),
             _ => vec![],
         };
         for frame in out {
@@ -124,13 +133,19 @@ async fn fake_cli(io: tokio::io::DuplexStream, recording: Recording) {
     }
 }
 
-/// Point the recorded prompt echo at the uuid of the prompt being replayed.
-fn with_echo_uuid(frames: Vec<String>, uuid: &Value) -> Vec<String> {
+/// Point the recorded turn at the prompt being replayed: its echo, and the
+/// prompts its `result` answered. A prompt the CLI refused before running
+/// it has no echo; only the `result` names it.
+fn for_prompt(frames: Vec<String>, uuid: &Value) -> Vec<String> {
     frames
         .into_iter()
         .map(|line| match serde_json::from_str::<Value>(&line) {
             Ok(mut f) if f["type"] == "user" && f["isReplay"] == true => {
                 f["uuid"] = uuid.clone();
+                f.to_string()
+            }
+            Ok(mut f) if f["type"] == "result" && f.get("origin").is_none_or(Value::is_null) => {
+                f["user_message_uuids"] = json!([uuid]);
                 f.to_string()
             }
             _ => line,

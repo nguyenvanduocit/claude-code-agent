@@ -12,6 +12,7 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -201,7 +202,30 @@ pub struct SdkMcpServer {
     /// Running `tools/call`s by JSON-RPC id; firing one cancels the call.
     /// One map per session (`for_session`): every CLI numbers its requests
     /// from 0, so ids from two sessions collide.
-    in_flight: Arc<DashMap<String, oneshot::Sender<()>>>,
+    in_flight: Arc<InFlight>,
+}
+
+/// Cancel senders of running calls by JSON-RPC id, each tagged with the
+/// call it belongs to: an id can come again (a reconnected client numbers
+/// from 0), and a finished call must not unregister a newer one.
+type InFlight = DashMap<String, (u64, oneshot::Sender<()>)>;
+
+/// Tags calls in `InFlight`.
+static NEXT_CALL: AtomicU64 = AtomicU64::new(0);
+
+/// A `tools/call` registered for cancellation; unregisters itself when
+/// dropped, whether the call ran, failed or never started.
+pub(crate) struct CallRegistration {
+    in_flight: Arc<InFlight>,
+    key: String,
+    tag: u64,
+    cancelled: oneshot::Receiver<()>,
+}
+
+impl Drop for CallRegistration {
+    fn drop(&mut self) {
+        self.in_flight.remove_if(&self.key, |_, (tag, _)| *tag == self.tag);
+    }
 }
 
 impl SdkMcpServer {
@@ -212,7 +236,7 @@ impl SdkMcpServer {
             version: "1.0.0".into(),
             timeout: None,
             tools: vec![],
-            in_flight: Arc::new(DashMap::new()),
+            in_flight: Arc::new(InFlight::new()),
         }
     }
 
@@ -239,7 +263,28 @@ impl SdkMcpServer {
     /// A copy of this server with its own in-flight call registry, for one
     /// session. Clones share the registry.
     pub(crate) fn for_session(&self) -> Self {
-        Self { in_flight: Arc::new(DashMap::new()), ..self.clone() }
+        Self { in_flight: Arc::new(InFlight::new()), ..self.clone() }
+    }
+
+    /// A copy of this server that shares `running`'s in-flight calls, so
+    /// they stay cancellable when `running` is replaced by this copy.
+    pub(crate) fn taking_over(&self, running: &Self) -> Self {
+        Self { in_flight: running.in_flight.clone(), ..self.clone() }
+    }
+
+    /// Register `message` for cancellation if it is a `tools/call`. The
+    /// session does this before it starts the call's task, so a
+    /// `notifications/cancelled` read after the call always finds it.
+    pub(crate) fn register_call(&self, message: &Value) -> Option<CallRegistration> {
+        (message.get("method").and_then(Value::as_str) == Some("tools/call"))
+            .then(|| self.register(message.get("id").unwrap_or(&Value::Null).to_string()))
+    }
+
+    fn register(&self, key: String) -> CallRegistration {
+        let tag = NEXT_CALL.fetch_add(1, Ordering::Relaxed);
+        let (cancel, cancelled) = oneshot::channel();
+        self.in_flight.insert(key.clone(), (tag, cancel));
+        CallRegistration { in_flight: self.in_flight.clone(), key, tag, cancelled }
     }
 
     /// This server's entry in an MCP server map (`--mcp-config`, `mcp_set_servers`).
@@ -254,11 +299,18 @@ impl SdkMcpServer {
     /// Answer one JSON-RPC message from the CLI. Notifications get an empty
     /// result: the control channel answers every `mcp_message`.
     pub async fn handle(&self, message: &Value) -> Value {
-        self.handle_in_session(message, None).await
+        let registration = self.register_call(message);
+        self.handle_in_session(message, None, registration).await
     }
 
-    /// `handle`, with the id of the session the message came from.
-    pub(crate) async fn handle_in_session(&self, message: &Value, session_id: Option<String>) -> Value {
+    /// `handle`, with the id of the session the message came from and the
+    /// `tools/call`'s registration from `register_call`.
+    pub(crate) async fn handle_in_session(
+        &self,
+        message: &Value,
+        session_id: Option<String>,
+        registration: Option<CallRegistration>,
+    ) -> Value {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let params = message.get("params");
@@ -271,7 +323,7 @@ impl SdkMcpServer {
             "ping" => rpc_result(id, json!({})),
             "notifications/cancelled" => {
                 let request_id = params.and_then(|p| p.get("requestId")).map(Value::to_string);
-                if let Some((_, cancel)) = request_id.and_then(|rid| self.in_flight.remove(&rid)) {
+                if let Some((_, (_, cancel))) = request_id.and_then(|rid| self.in_flight.remove(&rid)) {
                     let _ = cancel.send(());
                 }
                 json!({ "jsonrpc": "2.0", "result": {} })
@@ -281,43 +333,37 @@ impl SdkMcpServer {
                 let tools: Vec<Value> = self.tools.iter().map(|t| tool_listing(&t.def)).collect();
                 rpc_result(id, json!({ "tools": tools }))
             }
-            "tools/call" => self.call_tool(id, params, session_id).await,
+            "tools/call" => {
+                let registration = registration.unwrap_or_else(|| self.register(id.to_string()));
+                self.call_tool(id, params, session_id, registration).await
+            }
             other => rpc_error(id, -32601, &format!("Method '{other}' not found")),
         }
     }
 
-    async fn call_tool(&self, id: Value, params: Option<&Value>, session_id: Option<String>) -> Value {
+    /// Run a tool. `registration` unregisters when dropped, also when this
+    /// future is dropped mid-call.
+    async fn call_tool(
+        &self,
+        id: Value,
+        params: Option<&Value>,
+        session_id: Option<String>,
+        mut registration: CallRegistration,
+    ) -> Value {
         let name = params.and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("");
         let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or_else(|| json!({}));
         let Some(tool) = self.tools.iter().find(|t| t.def.name == name) else {
             return rpc_error(id, -32602, &format!("Tool '{name}' not found"));
         };
-        let key = id.to_string();
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        self.in_flight.insert(key.clone(), cancel_tx);
-        // Unregisters also when this future is dropped mid-call.
-        let _registered = InFlightGuard { in_flight: &self.in_flight, key: &key };
         let run = (tool.handler)(args, ToolContext::from_params(params, session_id));
         let outcome = tokio::select! {
             result = run => Some(result),
-            Ok(()) = cancel_rx => None,
+            Ok(()) = &mut registration.cancelled => None,
         };
         match outcome {
             Some(result) => rpc_result(id, result.into_wire()),
             None => rpc_error(id, REQUEST_CANCELLED, "Request cancelled"),
         }
-    }
-}
-
-/// Removes a tool call's cancel registration when dropped.
-struct InFlightGuard<'a> {
-    in_flight: &'a DashMap<String, oneshot::Sender<()>>,
-    key: &'a str,
-}
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        self.in_flight.remove(self.key);
     }
 }
 

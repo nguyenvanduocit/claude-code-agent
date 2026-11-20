@@ -165,17 +165,22 @@ pub mod __private {
 
     /// Turns a tool fn's return value into a [`ToolResult`](crate::ToolResult)
     /// by its type, not its spelling (so `type MyRes<T> = Result<T, E>` is
-    /// still a `Result`). Generated code runs
-    /// `(&value).__claude_tool_kind().convert(value)`: the impls on `Result`,
-    /// `ToolResult` and `()` match `&V` directly and win over the
-    /// `Serialize` fallback, which needs one more auto-ref.
+    /// still a `Result`). Generated code first runs
+    /// `(&value).__claude_tool_unwrap_kind().unwrap(value)`, which takes the
+    /// `Ok` value out of a `Result` (its error becomes an error result), then
+    /// `(&ok).__claude_tool_kind().convert(ok)`. In both steps the impls on
+    /// the specific types match `&V` directly and win over the fallback,
+    /// which needs one more auto-ref.
     pub mod ret {
         use crate::ToolResult;
         use serde::Serialize;
         use std::fmt::Display;
 
-        /// `Result<T, E>`: `T` as JSON, or an error result with `E: Display`.
+        /// `Result<T, E>`: `T`, converted by its own type, or an error
+        /// result with `E: Display`.
         pub struct ResultTag;
+        /// Not a `Result`: the value itself.
+        pub struct PlainTag;
         /// `ToolResult`: passed through.
         pub struct ToolResultTag;
         /// `()`: the text "ok".
@@ -186,11 +191,20 @@ pub mod __private {
         /// Selects [`ResultTag`].
         pub trait ResultKind {
             #[inline]
-            fn __claude_tool_kind(&self) -> ResultTag {
+            fn __claude_tool_unwrap_kind(&self) -> ResultTag {
                 ResultTag
             }
         }
         impl<T, E> ResultKind for Result<T, E> {}
+
+        /// Selects [`PlainTag`].
+        pub trait PlainKind {
+            #[inline]
+            fn __claude_tool_unwrap_kind(&self) -> PlainTag {
+                PlainTag
+            }
+        }
+        impl<T: ?Sized> PlainKind for &T {}
 
         /// Selects [`ToolResultTag`].
         pub trait ToolResultKind {
@@ -227,12 +241,15 @@ pub mod __private {
         }
 
         impl ResultTag {
-            /// Convert the returned `Result`.
-            pub fn convert<T: Serialize, E: Display>(self, value: Result<T, E>) -> ToolResult {
-                match value {
-                    Ok(v) => serialize(&v),
-                    Err(e) => ToolResult::error(e.to_string()),
-                }
+            /// The `Ok` value, or the error as an error result.
+            pub fn unwrap<T, E: Display>(self, value: Result<T, E>) -> Result<T, ToolResult> {
+                value.map_err(|e| ToolResult::error(e.to_string()))
+            }
+        }
+        impl PlainTag {
+            /// The value itself.
+            pub fn unwrap<T>(self, value: T) -> Result<T, ToolResult> {
+                Ok(value)
             }
         }
         impl ToolResultTag {

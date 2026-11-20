@@ -9,11 +9,16 @@
 //!     empties the conversation, and model, effort and permission mode are
 //!     set for the next checkout, so a task may change them for itself
 //!     (`set_model`, `set_effort`, `set_permission_mode`) without affecting
-//!     the next one
+//!     the next one. A permission mode left `None` is the one the session
+//!     started in (the settings' `permissions.defaultMode`, else `default`)
 //!   - dead sessions are dropped and replaced by a fresh spawn
-//!   - a session returned while its turn is still running is not reused;
-//!     it ends once its last handle is dropped (until then it runs outside
-//!     the `max_sessions` count)
+//!   - a checkout asking for `bypassPermissions` gets a session started in
+//!     it: the CLI switches to that mode only when it started in it
+//!   - a session is not reused when its turn is still running, when the CLI
+//!     cannot `/clear` it (`SessionOptions::disable_slash_commands`), or
+//!     when `max_sessions` sessions are idle already; it ends once its last
+//!     handle is dropped (until then it runs outside the `max_sessions`
+//!     count)
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -143,7 +148,10 @@ impl SessionPool {
         let options = checkout.options(&self.0.config.options);
 
         loop {
-            let next = self.idle().pop();
+            let next = {
+                let mut idle = self.idle();
+                idle.iter().rposition(|i| can_take(&i.session, &options)).map(|i| idle.remove(i))
+            };
             let Some(Idle { session, used }) = next else { break };
             if !session.is_alive() {
                 continue;
@@ -204,8 +212,15 @@ async fn reset(session: &Session, options: &SessionOptions) -> std::result::Resu
 async fn apply(session: &Session, options: &SessionOptions) -> std::result::Result<(), String> {
     session.set_model(options.model.as_deref()).await.map_err(|e| e.to_string())?;
     session.set_effort(options.effort).await.map_err(|e| e.to_string())?;
-    let mode = options.permission_mode.unwrap_or(PermissionMode::Default);
+    let mode = options.permission_mode.or_else(|| session.launch_permission_mode()).unwrap_or(PermissionMode::Default);
     session.set_permission_mode(mode).await.map_err(|e| e.to_string())
+}
+
+/// Whether `session` can switch to `options`' permission mode: the CLI
+/// refuses `bypassPermissions` unless the session started in it.
+fn can_take(session: &Session, options: &SessionOptions) -> bool {
+    options.permission_mode != Some(PermissionMode::BypassPermissions)
+        || session.launch_permission_mode() == Some(PermissionMode::BypassPermissions)
 }
 
 /// A session borrowed from the pool. Returns to the pool on Drop. Keep
@@ -228,8 +243,10 @@ impl std::ops::Deref for PooledSession {
 impl Drop for PooledSession {
     fn drop(&mut self) {
         // Synchronous: safe to drop outside a Tokio runtime.
-        if self.session.is_alive() && !self.session.is_busy() {
-            self.pool.idle().push(Idle { session: self.session.clone(), used: true });
+        let reusable = self.session.is_alive() && !self.session.is_busy() && self.session.offers_command("clear");
+        let mut idle = self.pool.idle();
+        if reusable && idle.len() < self.pool.0.config.max_sessions {
+            idle.push(Idle { session: self.session.clone(), used: true });
         }
         // Permit dropped here → semaphore released.
     }

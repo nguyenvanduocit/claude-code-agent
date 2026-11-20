@@ -765,8 +765,8 @@ pub struct SystemMessage {
     /// CLI version (`init`).
     #[serde(default)]
     pub claude_code_version: String,
-    /// Permission mode, as its wire value (`init`).
-    #[serde(default)]
+    /// Permission mode, as its wire value (`init`; sent as `permissionMode`).
+    #[serde(default, rename = "permissionMode")]
     pub permission_mode: String,
     /// Available tool names (`init`).
     #[serde(default)]

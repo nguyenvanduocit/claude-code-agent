@@ -8,7 +8,7 @@ You need the Claude Code CLI 2.1.329 or newer, installed and logged in. `Session
 
 ```toml
 [dependencies]
-claude-code-agent = "0.7"
+claude-code-agent = "0.8"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 ```
@@ -199,7 +199,7 @@ let mut stream = Agent::new(session.session.clone()).prompt("task one").await?;
 let fast = pool.acquire_with(Checkout { model: Some("haiku".into()), ..Default::default() }).await?;
 ```
 
-Dropping a pooled session returns it. Before the next task gets it, its conversation is cleared and its model, effort and permission mode are reset.
+Dropping a pooled session returns it. Before the next task gets it, its conversation is cleared and its model, effort and permission mode are reset. With `disable_slash_commands` the conversation cannot be cleared, so a used session is not handed out again.
 
 ## Testing without the CLI
 
@@ -236,7 +236,7 @@ Runnable programs for each feature are in `examples/`.
 Release: bump `version` in both `Cargo.toml` files (and the dependency on `claude-code-agent-macros`), push to `main`, then push the matching tag:
 
 ```sh
-git tag -a v0.7.1 -m v0.7.1 && git push origin v0.7.1
+git tag -a v0.8.0 -m v0.8.0 && git push origin v0.8.0
 ```
 
 `.github/workflows/release.yml` runs the tests on Linux, macOS and Windows, then publishes both crates to crates.io. No token is stored; crates.io trusts the workflow directly.

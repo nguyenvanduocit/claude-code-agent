@@ -207,6 +207,10 @@ pub enum AgentError {
     /// The session failed to send the prompt.
     #[error("session error: {0}")]
     Session(#[from] SessionError),
+    /// The CLI does not offer this slash command, e.g. with
+    /// `SessionOptions::disable_slash_commands`.
+    #[error("the CLI does not offer /{0}")]
+    CommandUnavailable(String),
 }
 
 /// Events of one turn; ends after `Done` or `Error`. Dropping it before
@@ -516,10 +520,7 @@ fn tool_results(u: &InboundUserMessage) -> Vec<AgentEvent> {
 
 /// Whether `frame` is the CLI's `command_lifecycle` "cancelled" for prompt `uuid`.
 fn is_cancelled(frame: &serde_json::Value, uuid: &str) -> bool {
-    let field = |k: &str| frame.get(k).and_then(|v| v.as_str());
-    field("type") == Some("command_lifecycle")
-        && field("state") == Some("cancelled")
-        && field("command_uuid").is_some_and(|u| u.eq_ignore_ascii_case(uuid))
+    crate::session::cancelled_prompt(frame).is_some_and(|u| u.eq_ignore_ascii_case(uuid))
 }
 
 /// Wrap `events` as subagent events when `parent` is set.

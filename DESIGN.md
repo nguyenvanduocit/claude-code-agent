@@ -215,6 +215,7 @@ claude-code-agent/
 │   ├── code_mode.rs     # patched CLI copy with Code Mode forced on, cached
 │   ├── protocol.rs      # wire types (control envelopes, frames, hook I/O)
 │   ├── session.rs       # process transport + reader/writer/watchdog, answers control requests
+│   ├── process_tree.rs  # Unix: process groups of the CLI's descendants, from the process table
 │   ├── agent.rs         # one prompt → AgentEvent stream, tracing span per turn
 │   ├── hooks.rs         # HookRegistry: async closures → initialize `hooks` + hook_callback
 │   ├── mcp.rs           # in-process MCP servers (SdkMcpServer, SdkTool) via mcp_message
@@ -227,7 +228,7 @@ claude-code-agent/
 ├── claude-code-agent-macros/   # #[claude_tool] → <fn>_tool_def() + <fn>_tool()
 ├── scripts/             # cli-parity.py: SDK coverage of the installed CLI's flags and requests
 └── tests/               # integration_test.rs (live CLI, --ignored), replay_test.rs, macro_usage.rs,
-                         # process_tree.rs (close() ends the process tree; runs on every CI OS)
+                         # fake_cli.rs (session behaviour against a fake CLI; runs on every CI OS)
 ```
 
 ## Observability
@@ -274,10 +275,25 @@ since an exited CLI's tools lose their parent link, and again before each signal
 `close()` closes stdin and waits up to 5 s for the CLI to exit; a CLI kept alive by
 background tasks then gets SIGTERM, then SIGKILL, sent to its group. Then the CLI's
 group and the collected tool groups get SIGTERM, and SIGKILL after 2 s if still there.
-Dropping the last Session clone does the same from a spawned task when a Tokio runtime
-is there (without one, only SIGTERM to the CLI's group). The CLI's group is signalled
-even when the CLI already died, for the children it left (MCP servers). On Windows the
-same steps use `taskkill /T /F` on the CLI's process tree.
+The CLI's group is signalled even when the CLI already died, for the children it left
+(MCP servers). The process table is not read for a CLI that was already reaped: its
+pid may belong to another process by then. `close()` runs in a task of its own, so it
+completes when its caller is dropped, as a hook or tool handler calling it is once the
+CLI exits. After `close()`, requests fail with `Closed`, not `ProcessExited`.
+
+Dropping the last Session clone without `close()` reads the process table and sends
+SIGTERM to the CLI's group and its tool groups on the dropping thread (no Tokio runtime
+needed), then a cleanup thread sends SIGKILL to what is left after the grace periods.
+For a CLI that already died only its own group is signalled. Reading the table blocks
+the dropping thread (`ps` on macOS, about 60 ms); it cannot move to another thread,
+because the CLI must not get SIGTERM before its tools are found, and a host that exits
+right after the drop would end that thread first.
+
+On Windows the CLI runs in a job object (`win32job`, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)
+and every process it starts joins it. `close()` ends the job after the grace period,
+whether or not the CLI exited by itself; dropping the session closes the job, which
+ends what is in it. If the job cannot be set up, `taskkill /T /F` on the CLI's process
+tree is the fallback, which misses processes the CLI left behind once it exited.
 
 Out of reach: a process that a hook or tool detached and that outlived it (`(cmd &)` in
 a hook, `nohup cmd &`). Its parent is gone and its group and session are its own, so
@@ -298,14 +314,24 @@ left to answer). Handlers are owned by the session, so one that captures a `Sess
 keeps it alive forever; handlers capture `Session::downgrade()` instead.
 
 Every control request, its stdin write included, is bounded by `control_timeout`: a
-hung CLI stops reading stdin and the pipe fills. The count of prompts in flight
-(`is_busy()`, the pool's reset check) survives cancellation: a prompt future dropped
-before its write uncounts it, and `interrupt_all` / `cancel_prompt` finish their count
-fix-up in their own task.
+hung CLI stops reading stdin and the pipe fills. The prompts in flight (`is_busy()`,
+the pool's reuse check) are tracked by uuid. A `result` ends every prompt it lists in
+`user_message_uuids` (several when the CLI merged prompts sent close together into one
+turn); a `result` that lists none and has no `origin` ends the oldest. A
+`command_lifecycle` "cancelled" frame, and the replies of `interrupt_all` /
+`cancel_prompt` (handled in their own task), end prompts withdrawn from the queue. A
+prompt future dropped before its write removes its prompt.
 
 Each session gets its own copy of every `SdkMcpServer`'s cancel registry: each CLI
 numbers its JSON-RPC requests from 0, so one registry shared by pooled sessions let a
-cancel from one session stop another's call.
+cancel from one session stop another's call. Every control request runs in a task of
+its own, so a `tools/call` is registered for cancellation by the reader before its task
+starts: a `notifications/cancelled` on a later line always finds it. Entries are tagged
+per call, so a finished call never unregisters a newer one that reused its id (a
+reconnected MCP client numbers from 0 again). `set_mcp_servers` keeps the registry of
+every server the CLI keeps, so calls running on it stay cancellable; while the CLI
+switches, old and new servers both answer, and the old list comes back if the CLI
+refuses.
 
 ## Event fanout
 
@@ -314,9 +340,11 @@ channel. No frame is dropped for a slow consumer: a lost echo or `result` would 
 the turn. The cost is memory: a subscriber that is never polled buffers every frame,
 so `subscribe()` and `Agent::watch()` streams are polled or dropped. A frame of a
 known type that fails to decode is delivered as `InboundMessage::Other` with its raw
-JSON; an undecodable `result` still ends its turn. When stdout ends, all subscriber channels close and in-flight streams end
-with `Error`. Assistant frames with `parent_tool_use_id` belong to a subagent and are
-not turned into the parent turn's `AgentEvent`s.
+JSON; an undecodable `result` still ends its turn, keeping its `user_message_uuids`. A
+stdout or stderr line that is not UTF-8 is decoded lossily rather than ending the
+stream. When stdout ends, all subscriber channels close and in-flight streams end
+with `Error`. Frames with `parent_tool_use_id` belong to a subagent: their events reach
+the parent turn's stream wrapped in `AgentEvent::Subagent`.
 
 ## Tool aliasing
 
