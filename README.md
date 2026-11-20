@@ -242,6 +242,8 @@ git tag -a v0.6.2 -m v0.6.2 && git push origin v0.6.2
 
 After a Claude Code update, run `python3 -I scripts/cli-parity.py` to list new CLI flags and requests the SDK doesn't support yet. Deliberate gaps and their reasons are in `scripts/cli-parity-ignore.txt`.
 
+To read the CLI's own source, run `python3 -I scripts/decompile-claude.py`. It unpacks the installed `claude` binary into `target/claude-src/<version>/`; `DESIGN.md` cites those files as `chunk-*.js:line`.
+
 ## License
 
 MIT
