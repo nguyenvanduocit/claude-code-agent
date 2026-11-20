@@ -128,7 +128,8 @@ mod macro_integration {
 
         let server = claude_code_agent::SdkMcpServer::new("t").tool(show_path_tool()).tool(echo_tool());
         let shown = call(&server, "show_path", serde_json::json!({ "path": "b.txt", "base": "/a", "tags": ["x", "y"] })).await;
-        assert_eq!(shown["content"][0]["text"], "/a/b.txt 2 x,y");
+        let joined = std::path::Path::new("/a").join("b.txt");
+        assert_eq!(shown["content"][0]["text"], format!("{} 2 x,y", joined.display()));
         assert!(shown.get("isError").is_none());
         let echoed = call(&server, "echo", serde_json::json!({ "value": { "k": [1, 2] } })).await;
         assert_eq!(echoed["content"][0]["text"], r#"{"k":[1,2]}"#);
