@@ -220,17 +220,17 @@ let opts = SessionOptions {
 let init = Initialize { supported_dialog_kinds: Some(vec!["auto_mode_server_fallback".into()]), ..Default::default() };
 ```
 
-CLI 2.1.329 sends these kinds to an SDK host:
+CLI 2.1.329 routes these kinds to an SDK host. The handler receives every kind the same way; the table says what each answer does.
 
-| Kind | When | Answers |
-|---|---|---|
-| `auto_mode_server_fallback` | auto mode falls back to billed classifier requests (e.g. API key behind a gateway) | `"continue"`, `"interrupt"` |
-| `refusal_fallback_prompt` | a model refuses and a fallback model is available | `"retry_fallback"`, `"edit_prompt"` |
-| `fable_overage_consent_prompt` | usage reaches the plan's overage limit | per payload |
-| `enum_prompt` | a CLI flow asks for one choice from a list | per payload |
-| `send_to_project_remote_control_offer` | sending to a project needs Remote Control | per payload |
+| Kind | When | Answers | Checked against the real CLI |
+|---|---|---|---|
+| `auto_mode_server_fallback` | auto mode falls back to billed classifier requests (e.g. API key behind a gateway) | `"continue"` runs the classifier; `"interrupt"` and `cancelled()` reject the tool call and end the turn | yes |
+| `refusal_fallback_prompt` | a model refuses and a fallback model is set | `"retry_fallback"` retries on the fallback model; `"edit_prompt"` and `cancelled()` end the turn with the refusal | yes |
+| `fable_overage_consent_prompt` | a subscription reaches its Fable usage limit | per payload; an answer can turn on overage billing | no: needs a real account at its limit |
+| `send_to_project_remote_control_offer` | sending to another project needs Remote Control | `"turned_on"`, `"already_on"`, `"declined"`, `"failed"` | no: sends to a real project |
+| `enum_prompt` | routed, but no flow in 2.1.329 sends it | per payload | not sent by 2.1.329 |
 
-`cancelled()` means the user dismissed the dialog; the CLI applies the dialog's default. Verified live for `auto_mode_server_fallback`: `"continue"` runs the classifier, `"interrupt"` and `cancelled()` reject the tool call and end the turn.
+`cancelled()` means the user dismissed the dialog; the CLI applies the dialog's default.
 
 ## Limitations
 
