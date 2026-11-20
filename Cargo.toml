@@ -28,6 +28,7 @@ tokio-stream = "0.1.19"
 async-stream = "0.3.6"
 
 [dev-dependencies]
-tokio-test   = "0.4"
-tokio-stream = "0.1.19"
-anyhow       = "1"
+tokio-test        = "0.4"
+tokio-stream      = "0.1.19"
+anyhow            = "1"
+claude-sdk-macros = { path = "claude-sdk-macros" }
