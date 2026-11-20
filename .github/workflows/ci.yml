@@ -14,7 +14,7 @@ jobs:
   check:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -24,5 +24,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features
       # Live-CLI tests are #[ignore]d; these run without credentials.
+      # tests/process_tree.rs checks close() ends the process tree per OS.
       - run: cargo test --workspace --all-features
       - run: cargo doc --workspace --no-deps --all-features

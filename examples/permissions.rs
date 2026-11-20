@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut input = req.input.clone();
                 let cmd = input["command"].as_str().unwrap_or("").to_string();
                 input["command"] = format!("echo '[sandboxed]' && {cmd}").into();
-                ToolDecision::Allow { updated_input: Some(input) }
+                ToolDecision::allow_with_input(input)
             }
             _ => ToolDecision::allow(),
         }

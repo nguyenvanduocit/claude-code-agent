@@ -1,13 +1,16 @@
 //! Agent layer — sends a turn and returns a streaming event iterator.
 //!
 //! Control requests (hook callbacks, can_use_tool) are answered by the
-//! `Session` itself; this layer only turns frames into `AgentEvent`s until
-//! the turn's `result` arrives.
+//! `Session` itself; this layer only turns frames into `AgentEvent`s.
+//! `prompt` yields the events of one turn; `watch` yields every turn's,
+//! including the turns the CLI starts on its own.
 use std::pin::Pin;
 use std::sync::Arc;
 
-
-use crate::protocol::{AssistantBlock, BackgroundTask, InboundMessage, ResultMessage, UserMessage};
+use crate::protocol::{
+    AssistantBlock, BackgroundTask, InboundMessage, InboundUserMessage, ResultMessage, TurnErrorKind,
+    UserMessage,
+};
 use crate::session::{Session, SessionError};
 
 // ─── Event stream ─────────────────────────────────────────────────────────────
@@ -18,39 +21,119 @@ pub enum AgentEvent {
     Text(String),
     /// A complete thinking block.
     Thinking(String),
-    /// A tool call the CLI is about to execute.
-    ToolUse { id: String, name: String, input: serde_json::Value },
+    /// Encrypted thinking, opaque to the host.
+    RedactedThinking(String),
+    /// A tool call: one the CLI runs, or one the API runs itself
+    /// (`server: true`, e.g. web search).
+    ToolUse { id: String, name: String, input: serde_json::Value, server: bool },
+    /// The result of a tool call. `content` is a string or content blocks,
+    /// as sent to the model; `structured` is the tool's full output when
+    /// the CLI reports one (e.g. Bash `{stdout, stderr, interrupted, …}`).
+    ToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+        is_error: bool,
+        structured: Option<serde_json::Value>,
+    },
+    /// An event of a subagent, started by the `Agent`/`Task` tool call
+    /// `parent_tool_use_id`.
+    Subagent { parent_tool_use_id: String, event: Box<AgentEvent> },
     /// Background task tree updated (replace semantics).
     BackgroundTasks(Vec<BackgroundTask>),
     /// Model was switched during the turn.
     ModelFallback { from: String, to: String, trigger: String },
     /// Context was compacted (`trigger`: "manual" for /compact, "auto").
     Compacted { trigger: String, pre_tokens: Option<u64>, post_tokens: Option<u64> },
+    /// Any other `system` frame (`init`, `api_retry`, `task_started`,
+    /// `hook_response`, `permission_denied`, `status`, …), verbatim.
+    System { subtype: String, data: serde_json::Value },
+    /// Any other frame (`rate_limit_event`, `tool_progress`,
+    /// `prompt_suggestion`, `command_lifecycle`, …), verbatim.
+    Other { kind: String, data: serde_json::Value },
     /// Turn completed successfully.
     Done(TurnResult),
     /// Turn failed.
-    Error(String),
+    Error(TurnError),
 }
 
 #[derive(Debug, Clone)]
 pub struct TurnResult {
     pub session_id: Option<String>,
+    /// Final text of the turn.
+    pub result: Option<String>,
+    /// Output matching `Initialize::json_schema`.
+    pub structured_output: Option<serde_json::Value>,
     pub total_cost_usd: Option<f64>,
     pub ttft_ms: Option<u64>,
     pub duration_ms: Option<u64>,
+    pub duration_api_ms: Option<u64>,
+    /// Agentic turns (model calls) the turn took.
+    pub num_turns: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    /// Per-model token and cost breakdown.
+    pub model_usage: Option<serde_json::Value>,
+    pub stop_reason: Option<String>,
+    pub terminal_reason: Option<String>,
+    /// Tool calls the permission system denied.
+    pub permission_denials: Vec<serde_json::Value>,
+    /// Set when the CLI started the turn itself (e.g. after a background
+    /// task finished); `None` for prompted turns.
+    pub origin: Option<serde_json::Value>,
 }
 
 impl From<&ResultMessage> for TurnResult {
     fn from(r: &ResultMessage) -> Self {
+        let usage = r.usage.as_ref();
         TurnResult {
             session_id: r.session_id.clone(),
+            result: r.result.clone(),
+            structured_output: r.structured_output.clone(),
             total_cost_usd: r.total_cost_usd,
             ttft_ms: r.ttft_ms,
             duration_ms: r.duration_ms,
-            input_tokens: r.usage.as_ref().map(|u| u.input_tokens),
-            output_tokens: r.usage.as_ref().map(|u| u.output_tokens),
+            duration_api_ms: r.duration_api_ms,
+            num_turns: r.num_turns,
+            input_tokens: usage.map(|u| u.input_tokens),
+            output_tokens: usage.map(|u| u.output_tokens),
+            cache_read_input_tokens: usage.and_then(|u| u.cache_read_input_tokens),
+            cache_creation_input_tokens: usage.and_then(|u| u.cache_creation_input_tokens),
+            model_usage: r.model_usage.clone(),
+            stop_reason: r.stop_reason.clone(),
+            terminal_reason: r.terminal_reason.clone(),
+            permission_denials: r.permission_denials.clone(),
+            origin: r.origin.clone(),
+        }
+    }
+}
+
+/// Why a turn failed. `result` carries cost and usage up to the failure.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub struct TurnError {
+    pub kind: TurnErrorKind,
+    pub message: String,
+    pub result: Option<TurnResult>,
+}
+
+impl From<&ResultMessage> for TurnError {
+    fn from(r: &ResultMessage) -> Self {
+        TurnError { kind: r.error_kind(), message: r.error_message(), result: Some(TurnResult::from(r)) }
+    }
+}
+
+impl TurnError {
+    fn cancelled() -> Self {
+        TurnError { kind: TurnErrorKind::Cancelled, message: "prompt cancelled before it ran".into(), result: None }
+    }
+
+    fn session_closed() -> Self {
+        TurnError {
+            kind: TurnErrorKind::SessionClosed,
+            message: "session closed before the turn finished".into(),
+            result: None,
         }
     }
 }
@@ -63,7 +146,8 @@ pub enum AgentError {
     Json(#[from] serde_json::Error),
 }
 
-/// Events of one turn; ends after `Done` or `Error`.
+/// Events of one turn; ends after `Done` or `Error`. Dropping it before
+/// then cancels the turn (see `Agent::prompt_message`).
 pub type AgentStream = Pin<Box<dyn tokio_stream::Stream<Item = AgentEvent> + Send + 'static>>;
 
 // ─── Agent ────────────────────────────────────────────────────────────────────
@@ -90,6 +174,10 @@ impl Agent {
     }
 
     /// Run a prompt built from content blocks (text, images, …).
+    ///
+    /// Dropping the stream before its `Done`/`Error` cancels the prompt:
+    /// still queued, it is withdrawn; running, its turn is interrupted.
+    /// Drain the stream to let the turn finish.
     pub async fn prompt_message(&self, message: UserMessage) -> Result<AgentStream, AgentError> {
         // Subscribe before sending so no frame of this turn is missed.
         let mut rx = self.session.subscribe();
@@ -109,24 +197,35 @@ impl Agent {
             error = tracing::field::Empty,
         );
 
-        // The stream keeps the session alive until its turn ends, even when
-        // the Agent and every other handle are dropped first.
-        let session = self.session.clone();
+        // Created outside the generator: a stream dropped before its first
+        // poll still cancels. It also keeps the session alive until the turn
+        // ends, even when the Agent and every other handle are dropped first.
+        let mut guard = CancelOnDrop { session: self.session.clone(), uuid: uuid.clone(), armed: true };
         let stream = async_stream::stream! {
-            let _session = session;
             // Turns run one after another and each ends with a `result`. Our
             // prompt's echo falls inside our turn: first for a normal prompt,
             // last for a slash command (after e.g. compact_boundary). So frames
             // since the previous `result` are held until the echo shows whose
-            // turn they are; a `result` before our echo closes someone else's
-            // turn (a queued prompt, or one the CLI started itself).
+            // turn they are. A `result` before our echo closes someone else's
+            // turn (a queued prompt, or one the CLI started itself) unless it
+            // names our prompt (a prompt refused up front is never echoed).
             let mut started = false;
             let mut held: Vec<Arc<InboundMessage>> = vec![];
             loop {
                 let Some(msg) = rx.recv().await else {
-                    yield AgentEvent::Error("session closed before the turn finished".into());
+                    guard.disarm();
+                    yield AgentEvent::Error(TurnError::session_closed());
                     break;
                 };
+                // Withdrawn before it ran (`cancel_prompt`, `interrupt_all`):
+                // no `result` will come.
+                if let InboundMessage::Other(frame) = msg.as_ref()
+                    && is_cancelled(frame, &uuid)
+                {
+                    guard.disarm();
+                    yield AgentEvent::Error(TurnError::cancelled());
+                    break;
+                }
 
                 if !started {
                     match msg.as_ref() {
@@ -138,13 +237,32 @@ impl Agent {
                                 }
                             }
                         }
-                        InboundMessage::Result(_) => held.clear(),
-                        _ => held.push(msg),
+                        // Refused before it started: no echo, but the
+                        // result names our prompt. The held frames are ours.
+                        InboundMessage::Result(r) if r.answers(&uuid) => {
+                            started = true;
+                            for m in held.drain(..) {
+                                for ev in to_events(&m, partial) {
+                                    yield ev;
+                                }
+                            }
+                        }
+                        InboundMessage::Result(_) => {
+                            held.clear();
+                            continue;
+                        }
+                        _ => {
+                            held.push(msg);
+                            continue;
+                        }
                     }
-                    continue;
+                    if !matches!(msg.as_ref(), InboundMessage::Result(_)) {
+                        continue;
+                    }
                 }
 
                 if let InboundMessage::Result(r) = msg.as_ref() {
+                    guard.disarm();
                     let t = TurnResult::from(r);
                     if let Some(v) = t.total_cost_usd { span.record("cost_usd", v); }
                     if let Some(v) = t.input_tokens { span.record("input_tokens", v); }
@@ -164,29 +282,94 @@ impl Agent {
 
         Ok(Box::pin(stream))
     }
+
+    /// Every event of every turn from now on — prompted turns and the turns
+    /// the CLI starts itself (`TurnResult::origin` set), each ending with
+    /// `Done` or `Error`. Ends when the session closes. Dropping it cancels
+    /// nothing.
+    pub fn watch(&self) -> AgentStream {
+        let mut rx = self.session.subscribe();
+        let partial = self.session.include_partial();
+        Box::pin(async_stream::stream! {
+            while let Some(msg) = rx.recv().await {
+                for ev in to_events(&msg, partial) {
+                    yield ev;
+                }
+            }
+        })
+    }
 }
 
-/// The AgentEvents one frame of the prompt's own turn produces.
-/// `partial`: text arrives as stream deltas, so complete assistant text is skipped.
-/// Frames of subagents (`parent_tool_use_id` set) belong to the subagent, not
-/// to this stream.
+/// Cancels the prompt `uuid` unless disarmed (its turn ended).
+struct CancelOnDrop {
+    session: Session,
+    uuid: String,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed || !self.session.is_alive() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("turn stream dropped outside a Tokio runtime; the turn keeps running");
+            return;
+        };
+        let session = self.session.clone();
+        let uuid = std::mem::take(&mut self.uuid);
+        rt.spawn(async move {
+            if let Err(e) = session.cancel_prompt(&uuid).await {
+                tracing::debug!(error = %e, "cancelling a dropped turn failed");
+            }
+        });
+    }
+}
+
+/// The AgentEvents one frame produces. `partial`: text arrives as stream
+/// deltas, so complete main-thread text is skipped. Frames of subagents
+/// (`parent_tool_use_id` set) are wrapped in `AgentEvent::Subagent`; their
+/// text comes from complete messages only.
 fn to_events(msg: &InboundMessage, partial: bool) -> Vec<AgentEvent> {
     match msg {
-        InboundMessage::Assistant(a) if a.parent_tool_use_id.is_none() => a
-            .message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                AssistantBlock::Text { text } if !partial => Some(AgentEvent::Text(text.clone())),
-                AssistantBlock::Thinking { thinking } if !partial => Some(AgentEvent::Thinking(thinking.clone())),
+        InboundMessage::Assistant(a) => {
+            let sub = a.parent_tool_use_id.is_some();
+            let events = a.message.content.iter().filter_map(|block| match block {
+                AssistantBlock::Text { text } if sub || !partial => Some(AgentEvent::Text(text.clone())),
+                AssistantBlock::Thinking { thinking } if sub || !partial => {
+                    Some(AgentEvent::Thinking(thinking.clone()))
+                }
+                AssistantBlock::RedactedThinking { data } => Some(AgentEvent::RedactedThinking(data.clone())),
                 AssistantBlock::ToolUse { id, name, input } => Some(AgentEvent::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
+                    server: false,
+                }),
+                AssistantBlock::ServerToolUse { id, name, input } => Some(AgentEvent::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    server: true,
+                }),
+                AssistantBlock::WebSearchToolResult { tool_use_id, content } => Some(AgentEvent::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: content.clone(),
+                    is_error: false,
+                    structured: None,
                 }),
                 _ => None,
-            })
-            .collect(),
+            });
+            in_thread(a.parent_tool_use_id.as_deref(), events.collect())
+        }
+
+        InboundMessage::User(u) => in_thread(u.parent_tool_use_id.as_deref(), tool_results(u)),
 
         InboundMessage::StreamEvent(se) if se.parent_tool_use_id.is_none() => {
             let delta = se.event.get("delta");
@@ -226,14 +409,55 @@ fn to_events(msg: &InboundMessage, partial: bool) -> Vec<AgentEvent> {
                     post_tokens: num("post_tokens"),
                 }]
             }
-            _ => vec![],
+            other => vec![AgentEvent::System {
+                subtype: other.to_string(),
+                data: serde_json::to_value(s).unwrap_or_default(),
+            }],
         },
 
+        InboundMessage::Other(data) => vec![AgentEvent::Other {
+            kind: data.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+            data: data.clone(),
+        }],
+
         InboundMessage::Result(r) if r.is_success() => vec![AgentEvent::Done(TurnResult::from(r))],
-        InboundMessage::Result(r) => {
-            vec![AgentEvent::Error(r.error_message())]
-        }
+        InboundMessage::Result(r) => vec![AgentEvent::Error(TurnError::from(r))],
 
         _ => vec![],
+    }
+}
+
+/// The `ToolResult` events of a `user` frame. The frame's
+/// `tool_use_result` is the structured output of its (single) tool result.
+fn tool_results(u: &InboundUserMessage) -> Vec<AgentEvent> {
+    let results = u.tool_results();
+    let structured = if results.len() == 1 { u.tool_use_result.clone() } else { None };
+    results
+        .into_iter()
+        .map(|r| AgentEvent::ToolResult {
+            tool_use_id: r.tool_use_id,
+            content: r.content,
+            is_error: r.is_error,
+            structured: structured.clone(),
+        })
+        .collect()
+}
+
+/// Whether `frame` is the CLI's `command_lifecycle` "cancelled" for prompt `uuid`.
+fn is_cancelled(frame: &serde_json::Value, uuid: &str) -> bool {
+    let field = |k: &str| frame.get(k).and_then(|v| v.as_str());
+    field("type") == Some("command_lifecycle")
+        && field("state") == Some("cancelled")
+        && field("command_uuid").is_some_and(|u| u.eq_ignore_ascii_case(uuid))
+}
+
+/// Wrap `events` as subagent events when `parent` is set.
+fn in_thread(parent: Option<&str>, events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+    match parent {
+        None => events,
+        Some(p) => events
+            .into_iter()
+            .map(|event| AgentEvent::Subagent { parent_tool_use_id: p.to_string(), event: Box::new(event) })
+            .collect(),
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "claude-sdk"
-version = "0.3.0"
+version = "0.4.0"
 rust-version = "1.88"
 edition = "2024"
 description = "Rust SDK for Claude Code — persistent subprocess, hook callbacks, in-process tools, record/replay"
@@ -18,14 +18,14 @@ default = []
 macros  = ["dep:claude-sdk-macros"]
 
 [dependencies]
-tokio        = { version = "1", features = ["rt", "process", "io-util", "sync", "time", "fs"] }
+tokio        = { version = "1", features = ["rt", "process", "io-util", "sync", "time", "fs", "macros"] }
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 thiserror    = "2"
 tracing      = "0.1"
 dashmap      = "6"
 
-claude-sdk-macros      = { version = "0.3.0", path = "claude-sdk-macros", optional = true }
+claude-sdk-macros      = { version = "0.4.0", path = "claude-sdk-macros", optional = true }
 
 tokio-stream = "0.1.19"
 async-stream = "0.3.6"
@@ -40,8 +40,13 @@ tokio             = { version = "1", features = ["full"] }
 tokio-stream      = "0.1.19"
 anyhow            = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-claude-sdk-macros = { version = "0.3.0", path = "claude-sdk-macros" }
+claude-sdk-macros = { version = "0.4.0", path = "claude-sdk-macros" }
 
 [[example]]
 name = "tools"
 required-features = ["macros"]
+
+# Runs its own executable as a fake CLI, so it needs its own `main`.
+[[test]]
+name = "process_tree"
+harness = false

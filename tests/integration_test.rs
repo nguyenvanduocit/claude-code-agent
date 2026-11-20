@@ -313,9 +313,10 @@ async fn api_error_ends_turn_with_error() {
             _ => {}
         }
     }
-    let message = outcome.expect("no result").expect("turn reported Done");
-    eprintln!("error={message:?}");
-    assert!(message.contains("claude-nonexistent-9"), "{message}");
+    let error = outcome.expect("no result").expect("turn reported Done");
+    eprintln!("error={error:?}");
+    assert_eq!(error.kind, claude_sdk::protocol::TurnErrorKind::Api);
+    assert!(error.message.contains("claude-nonexistent-9"), "{error}");
 }
 
 /// `code_mode` runs a patched CLI copy: the REPL tool exists and Claude uses it.

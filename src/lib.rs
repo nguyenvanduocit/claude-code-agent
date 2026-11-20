@@ -125,30 +125,35 @@ pub mod session;
 
 // ── Top-level re-exports ───────────────────────────────────────────────────────
 
-pub use agent::{Agent, AgentError, AgentEvent, AgentStream, TurnResult};
+pub use agent::{Agent, AgentError, AgentEvent, AgentStream, TurnError, TurnResult};
 pub use hooks::HookRegistry;
-pub use mcp::{SdkMcpServer, SdkTool, ToolResult};
+pub use mcp::{SdkMcpServer, SdkTool, ToolContent, ToolContext, ToolResult};
 /// `#[claude_tool]` — enable with the `macros` feature.
 #[cfg(feature = "macros")]
 pub use claude_sdk_macros::claude_tool;
-pub use pool::{PoolConfig, PooledSession, SessionPool};
+pub use pool::{Checkout, PoolConfig, PooledSession, SessionPool};
 pub use protocol::{
     // Core messages
-    Initialize, UserMessage, ContentBlock,
+    Initialize, UserMessage, ContentBlock, Priority,
+    // Session settings
+    Autocompact, Effort, PermissionMode, PermissionPrompts, Thinking, ThinkingDisplay,
     // Inbound
     InboundMessage, SystemMessage, AssistantMessage, ResultMessage, UsageSummary,
-    BackgroundTask,
+    BackgroundTask, TurnErrorKind,
     // Control
     ToolDecision, HookOutput, HookDecision, ControlRequest, ControlRequestBody,
-    ControlResponse, CanUseToolRequest,
+    ControlResponse, CanUseToolRequest, ElicitationRequest, ElicitationResponse, UserDialogRequest,
     // Hook types
     HookEventKind, HookEventPayload, HookCallbackRequest,
     // Tools/MCP
-    ToolDef, McpManifest,
+    ToolDef, ToolAnnotations, McpManifest,
     // Background
     BackgroundTasksRequest,
 };
-pub use session::{CanUseTool, Session, SessionError, SessionOptions};
+pub use session::{
+    CanUseTool, McpCall, OnElicitation, OnStderr, OnUserDialog, ReloadPlugins, Session, SessionError,
+    SessionOptions,
+};
 
 /// Re-exports used by code generated from `#[claude_tool]`. Not public API.
 #[doc(hidden)]

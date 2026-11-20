@@ -1,13 +1,15 @@
 # claude-sdk
 
-Rust SDK for [Claude Code](https://claude.ai/claude-code). It drives the `claude` CLI (verified against 2.1.328) over its stream-json control protocol:
+Rust SDK for [Claude Code](https://claude.ai/claude-code). It drives the `claude` CLI over its stream-json control protocol. Verified against 2.1.329; `Session::spawn` refuses an older CLI (`MIN_CLI_VERSION`).
 
-- one persistent `claude` process per session; `close()` ends the whole process group
-- hook callbacks and `can_use_tool` permission handlers as async Rust closures
-- Rust functions as tools (`#[claude_tool]` + SDK MCP bridge), executed in-process
-- control requests: `interrupt`, `set_model`, `set_permission_mode`, `stop_task`, `context_usage`
+- one persistent `claude` process per session; `close()` ends the whole process group (process tree on Windows)
+- every `claude --help` flag an SDK session can use, as a typed `SessionOptions` field (`extra_args` for the rest)
+- every public control request as a `Session` method: model, effort, thinking, permission mode, interrupt, MCP servers, settings, usage, rewind, …
+- a lossless event stream: text, thinking, tool calls and their results, subagent events, every `system` frame, the full turn result
+- hook callbacks, `can_use_tool`, MCP elicitation and user-dialog handlers as async Rust closures
+- Rust functions as tools (`#[claude_tool]` + SDK MCP bridge), executed in-process, cancellable
 - Code Mode (`REPL` tool) forced on with `code_mode: true`
-- text and image prompts (`UserMessage::blocks` + `ContentBlock::image_base64`)
+- text, image and document prompts (`UserMessage::blocks`)
 - record/replay for tests without a process, session pool, `tracing` spans
 
 ## Install
@@ -15,7 +17,7 @@ Rust SDK for [Claude Code](https://claude.ai/claude-code). It drives the `claude
 Pin the git dependency to a commit or tag:
 
 ```toml
-claude-sdk = { git = "https://github.com/nguyenvanduocit/claude-sdk-rs", tag = "v0.3.0", features = ["macros"] }
+claude-sdk = { git = "https://github.com/nguyenvanduocit/claude-sdk-rs", tag = "v0.4.0", features = ["macros"] }
 ```
 
 ## Quick start
@@ -89,7 +91,7 @@ let mut stream = Agent::new(s.session.clone()).prompt("task one").await?;
 // … drop `s` to return it; the next acquire() resets it with /clear first
 ```
 
-Every pooled session uses `PoolConfig::options` (hooks, MCP servers, model). A returned session is reset with `/clear` (local, no API call, new session id) before reuse, so tasks never see each other's conversation.
+Every pooled session uses `PoolConfig::options` (hooks, MCP servers, model). `pool.acquire_with(Checkout { model: Some("haiku".into()), ..Default::default() })` hands out a session with its own model, effort or permission mode; `None` keeps the pool's value. A returned session is reset before reuse: `/clear` (local, no API call, new session id) empties the conversation, and model, effort and permission mode are set for the next checkout. A task may switch them for itself without affecting the next task.
 
 ## Rust functions as tools — `#[claude_tool]` + SDK MCP server
 
@@ -114,6 +116,37 @@ let session = Session::spawn(opts, Initialize::default()).await?;
 The macro generates `search_files_tool_def() -> ToolDef` and `search_files_tool() -> SdkTool`.
 Arguments are decoded with serde; `Result<T, E>` maps to a result or an error result.
 SDK tools are added to `--allowedTools` automatically. Enable with `claude-sdk = { features = ["macros"] }`.
+
+## Events and results
+
+`Agent::prompt` streams one turn's `AgentEvent`s and ends with `Done(TurnResult)` or `Error(TurnError)`:
+
+| Event | Carries |
+|---|---|
+| `Text`, `Thinking`, `RedactedThinking` | model output |
+| `ToolUse { id, name, input, server }` | a tool call (`server: true` for API-run tools such as web search) |
+| `ToolResult { tool_use_id, content, is_error, structured }` | the result; `structured` is the tool's full output, e.g. Bash `{stdout, stderr, …}` |
+| `Subagent { parent_tool_use_id, event }` | any event of a subagent |
+| `System { subtype, data }`, `Other { kind, data }` | every other frame, verbatim (`api_retry`, `task_started`, `rate_limit_event`, …) |
+| `Done(TurnResult)` | `result` text, `structured_output`, cost, tokens, `num_turns`, `model_usage`, `permission_denials`, `terminal_reason` |
+| `Error(TurnError)` | `kind` (`Execution`, `MaxTurns`, `MaxBudget`, `Api`, …), message, and the `TurnResult` so far |
+
+Structured output: set `Initialize::json_schema`; the parsed value arrives in `TurnResult::structured_output` (`examples/structured_output.rs`).
+
+`Agent::watch()` streams every turn, including the ones the CLI starts itself after a background task finishes (`TurnResult::origin` set). `examples/watch.rs`.
+
+## Cancelling
+
+Dropping a turn's stream before `Done`/`Error` cancels the prompt: a queued prompt is withdrawn, a running one is interrupted. Another prompt's turn is never touched. `Session::cancel_prompt(uuid)` does the same explicitly; `Session::interrupt()` stops whatever runs; `Session::interrupt_all()` also cancels every queued prompt. A prompt withdrawn before it ran ends its stream with `TurnErrorKind::Cancelled`. A prompt sent with `UserMessage::with_priority(Priority::Now)` aborts the running turn and runs at once; the aborted turn ends with `Done` and `terminal_reason: "aborted_streaming"`.
+
+When the CLI withdraws a request it asked the host (e.g. `can_use_tool` during an interrupt), the handler's future is dropped and no answer is sent. An interrupted SDK tool call drops its handler the same way.
+
+## MCP servers
+
+- in-process: `SessionOptions::mcp_servers` (`SdkMcpServer`), with `timeout`, tool `title`/`annotations`/`output_schema`, and `ToolResult` text, image, resource and `structured` content. `SdkTool::with_context` gives the handler the call's `tool_use_id`.
+- external (stdio, http, sse): `Initialize::mcp_servers`.
+- at runtime: `Session::set_mcp_servers(sdk, external)`, `mcp_status`, `mcp_toggle`, `mcp_reconnect`, `mcp_call` (external servers, no model turn).
+- elicitation: `SessionOptions::on_elicitation` answers an MCP server asking the user for input.
 
 ## Record / replay — tests without a process or API cost
 
@@ -150,8 +183,19 @@ Experimental and unsupported by Anthropic: Code Mode is gated server-side, and t
 | `setting_sources: Some(vec![])` | ignore user/project settings (`--setting-sources ""`); auth still works |
 | `settings: Some(json)` | extra settings (`--settings`): an object, or a file path string; e.g. shell hooks |
 | `clear_env: true` | child gets only `env`, not the parent environment (default inherits, like the official SDKs) |
-| `resume: Some(id)` / `Session::reconnect` | continue a previous conversation (`--resume`) |
+| `resume: Some(id)` / `Session::reconnect` | continue a previous conversation (`--resume`); with `fork_session: true` under a new id |
+| `continue_conversation: true` | continue the latest conversation in `cwd` |
 | `include_partial: true` | text arrives as stream deltas |
+| `model`, `fallback_model`, `effort`, `thinking` | model choice; switch mid-session with `set_model`, `set_effort`, `set_max_thinking_tokens` |
+| `max_turns`, `max_budget_usd`, `task_budget` | limits; a turn past one ends with `TurnErrorKind::MaxTurns` / `MaxBudget` |
+| `tools`, `allowed_tools`, `disallowed_tools`, `add_dirs` | tool set and file access |
+| `persist_session: false` | no transcript on disk |
+| `on_stderr` | every CLI stderr line, live |
+| `extra_args` | flags without a field |
+
+## Keeping up with the CLI
+
+`python3 -I scripts/cli-parity.py` lists every `claude --help` flag and public control request the SDK does not cover (exit 1 when any is left). Deliberate omissions, each with its reason, are in `scripts/cli-parity-ignore.txt`. Run it after each Claude Code update.
 
 ## Hook events
 
@@ -162,7 +206,12 @@ Experimental and unsupported by Anthropic: Code Mode is gated server-side, and t
 ## Limitations
 
 - `code_mode` runs a patched copy of the CLI. The patch anchors on minified code, so a CLI release that changes the Code Mode module makes spawn fail with `CodeModeError::Anchor` until the anchors are updated. Verified on 2.1.329.
-- Tool results from SDK tools are text.
+- Tools of servers added with `set_mcp_servers` are not pre-allowed: the permission mode and `can_use_tool` decide.
+- `mcp_call` and `mcp_read_resource` reach external MCP servers only; the CLI refuses in-process ones.
+- `on_user_dialog` (`request_user_dialog`) is wired but untested: no tool in 2.1.329 sent one in our runs.
+- `set_system_prompt` works only while the session runs the account's default model (CLI 2.1.329 cannot confirm another); `set_model_and_system_prompt` works always.
+- `UserMessage::with_timestamp` is sent, but CLI 2.1.329 records its own receive time.
+- Windows process-tree cleanup (`taskkill /T`) is covered by `tests/process_tree.rs` in CI's `windows-latest` job; local runs were on macOS.
 - No credential handling: the CLI uses its own login.
 
 ## License

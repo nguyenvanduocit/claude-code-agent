@@ -1,0 +1,58 @@
+# CLI surface the SDK leaves out on purpose. One name per line, then the reason.
+
+# Set through `Initialize` fields instead of flags.
+--agents                                  Initialize::agents
+--system-prompt                           Initialize::system_prompt
+--append-system-prompt                    Initialize::append_system_prompt
+--json-schema                             Initialize::json_schema
+--exclude-dynamic-system-prompt-sections  Initialize::exclude_dynamic_sections
+--forward-subagent-text                   Initialize::forward_subagent_text
+--prompt-suggestions                      Initialize::prompt_suggestions
+--system-prompt-snapshot                  Initialize::system_prompt_snapshot
+
+# Covered by another option.
+--dangerously-skip-permissions            SessionOptions::permission_mode = BypassPermissions
+--allow-dangerously-skip-permissions      SessionOptions::permission_mode = BypassPermissions
+--debug                                   SessionOptions::debug_file, or extra_args
+--allowed                                 regex fragment of --allowedTools (covered)
+--disallowed                              regex fragment of --disallowedTools (covered)
+
+# Interactive terminal, desktop or remote-session features.
+--ax-screen-reader                        terminal rendering
+--bg                                      interactive background session
+--chrome                                  interactive Claude in Chrome
+--no-chrome                               interactive Claude in Chrome
+--cloud                                   creates a cloud session, not a local SDK session
+--desktop                                 opens Claude Desktop
+--environment                             cloud session on a self-hosted runner
+--ide                                     IDE auto-connect
+--teleport                                resumes a web session in the terminal
+--tmux                                    terminal panes
+--remote-control                          Remote Control bridge
+--remote-control-session-name-prefix      Remote Control bridge
+--from-pr                                 interactive PR session picker
+--print                                   one-shot mode; the SDK runs stream-json
+--help                                    CLI help
+--version                                 read with Session::cli_version
+
+# Control requests that only matter to hosts this SDK is not.
+set_has_subscribers                       only with CLAUDE_CODE_STREAM_EVENT_HOLD_MS
+code_change_published                     field of a system frame, not a control request
+vcs_state_changed                         field of a system frame, not a control request
+set_color                                 answered "Unsupported control request subtype" over stdio (2.1.329)
+
+# Fields left out on purpose (`subtype.field`).
+initialize.sdkMcpServers                  in-process servers are declared with --mcp-config (same config shape, verified)
+initialize.sdkMcpServerConfigs            server config (timeout) goes in the --mcp-config entry
+initialize.sdkMcpServerManifests          handshake shortcut; the full MCP handshake runs instead
+initialize.sdkMcpServerManifestsOrigin    only with sdkMcpServerManifests over a remote transport
+mcp_status.liveReply                      cloud / Remote Control workers only
+mcp_call.expires_at                       staged calls on a cloud worker's synced-file lane
+mcp_call.input_files                      staged calls on a cloud worker's synced-file lane
+mcp_call.output_files                     staged calls on a cloud worker's synced-file lane
+success.pending_permission_requests       for a client joining a running CLI; the SDK starts its own
+success.pending_user_dialog_requests      for a client joining a running CLI; the SDK starts its own
+success.pending_elicitation_requests      for a client joining a running CLI; the SDK starts its own
+error.pending_permission_requests         for a client joining a running CLI; the SDK starts its own
+error.pending_user_dialog_requests        for a client joining a running CLI; the SDK starts its own
+error.pending_elicitation_requests        for a client joining a running CLI; the SDK starts its own

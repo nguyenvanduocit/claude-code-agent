@@ -40,9 +40,64 @@ pub struct Initialize {
     /// Subagent definitions, keyed by agent name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents: Option<serde_json::Value>,
-    /// JSON schema for structured output.
+    /// JSON schema for structured output; the result arrives in
+    /// `TurnResult::structured_output`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<serde_json::Value>,
+    /// Session title; skips automatic title generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Load only the skills with these names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    /// Plugins to load, e.g. `{"type": "local", "path": "./my-plugin"}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<Vec<serde_json::Value>>,
+    /// MCP servers the CLI runs or connects to, keyed by name: stdio
+    /// (`{"command": …, "args": […]}`), `http` or `sse` configs.
+    /// In-process servers go in `SessionOptions::mcp_servers`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Replaces the default plan-mode workflow text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_mode_instructions: Option<String>,
+    /// Omit per-user dynamic sections (working directory, memory path) from
+    /// the system prompt, so it caches across users.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_dynamic_sections: Option<bool>,
+    /// Record the system prompt once per conversation and reuse it verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt_snapshot: Option<bool>,
+    /// Emit `prompt_suggestion` frames after turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_suggestions: Option<bool>,
+    /// Emit progress summaries of running subagents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_progress_summaries: Option<bool>,
+    /// Forward subagent text and thinking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward_subagent_text: Option<bool>,
+    /// Tool-name aliases applied before tool-name resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_aliases: Option<HashMap<String, String>>,
+    /// `request_user_dialog` kinds `SessionOptions::on_user_dialog` renders;
+    /// the CLI sends only these kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_dialog_kinds: Option<Vec<String>>,
+    /// Declares that the host renders a per-task stop control (`stop_task`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_task_stop_affordance: Option<bool>,
+    /// Workspace trust the host obtained from the user for `directory`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_trust: Option<WorkspaceTrust>,
+}
+
+/// Send `accepted: true` only after the user accepted a trust dialog for
+/// `directory`. Source: binary initialize.workspaceTrust schema
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceTrust {
+    pub accepted: bool,
+    pub directory: String,
 }
 
 /// One hook matcher in the initialize request.
@@ -82,6 +137,118 @@ impl PermissionMode {
     }
 }
 
+/// Effort levels accepted by `--effort` and `set_effort`.
+/// Source: `claude --help` (2.1.329)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// `--thinking`. Source: binary `--thinking <mode>` option (hidden)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking {
+    Enabled,
+    Adaptive,
+    Disabled,
+}
+
+impl Thinking {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Adaptive => "adaptive",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// How thinking content appears (`--thinking-display`, `set_max_thinking_tokens`).
+/// Source: binary thinking-display enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+    Highlights,
+}
+
+impl ThinkingDisplay {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarized => "summarized",
+            Self::Omitted => "omitted",
+            Self::Highlights => "highlights",
+        }
+    }
+}
+
+/// `--autocompact`: when the CLI compacts the context on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Autocompact {
+    /// The CLI's default window.
+    Auto,
+    /// Compact at this many tokens (at least 100 000).
+    Tokens(u64),
+}
+
+impl Autocompact {
+    pub fn to_arg(self) -> String {
+        match self {
+            Self::Auto => "auto".into(),
+            Self::Tokens(n) => n.to_string(),
+        }
+    }
+}
+
+/// `--permission-prompts`: who answers a permission prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionPrompts {
+    /// The SDK host (`SessionOptions::can_use_tool`).
+    Host,
+    /// Nobody: anything that would prompt is denied.
+    None,
+}
+
+impl PermissionPrompts {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::None => "none",
+        }
+    }
+}
+
+/// When a prompt sent during a running turn is taken in.
+/// Source: binary user-message `priority` enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    /// Aborts the running turn, then runs. The aborted turn still ends with
+    /// a `success` result (`terminal_reason: "aborted_streaming"`).
+    Now,
+    /// Taken in at the next opportunity inside the running turn.
+    Next,
+    /// Queued until the running turn ends.
+    Later,
+}
+
 /// A user turn.
 /// Source: _internal/client.py:126–131
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +260,20 @@ pub struct UserMessage {
     /// Echoed back (`isReplay: true`) when the CLI starts this message's turn,
     /// because the session runs with `--replay-user-messages`.
     pub uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Priority>,
+    /// `Some(false)`: append to the conversation without starting a turn.
+    #[serde(default, rename = "shouldQuery", skip_serializing_if = "Option::is_none")]
+    pub should_query: Option<bool>,
+    /// ISO 8601 time the message was created. Part of the wire schema, but
+    /// CLI 2.1.329 records its own receive time in the echo and transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    /// `Some(true)`: the host composed this text (the user did not type it).
+    /// The CLI delivers it as written: no `@path` expansion, no slash-command
+    /// dispatch, and no turn-start context attachments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_composed: Option<bool>,
 }
 
 impl UserMessage {
@@ -107,7 +288,36 @@ impl UserMessage {
             message: UserMessageBody { role: "user".into(), content },
             parent_tool_use_id: None,
             uuid: uuid::Uuid::new_v4().to_string(),
+            priority: None,
+            should_query: None,
+            timestamp: None,
+            client_composed: None,
         }
+    }
+
+    /// Creation time as an ISO 8601 string, e.g. "2026-11-20T07:03:32.670Z".
+    pub fn with_timestamp(mut self, timestamp: impl Into<String>) -> Self {
+        self.timestamp = Some(timestamp.into());
+        self
+    }
+
+    /// Mark the text as host-composed: delivered verbatim, with no `@path`
+    /// expansion, slash-command dispatch or turn-start attachments.
+    pub fn client_composed(mut self) -> Self {
+        self.client_composed = Some(true);
+        self
+    }
+
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    /// Add the message to the conversation without starting a turn. Its
+    /// content is seen by the model on the next prompt.
+    pub fn context_only(mut self) -> Self {
+        self.should_query = Some(false);
+        self
     }
 }
 
@@ -124,10 +334,19 @@ pub enum ContentBlock {
     Text { text: String },
     #[serde(rename = "image")]
     Image { source: ImageSource },
+    /// A PDF or plain-text document.
+    #[serde(rename = "document")]
+    Document {
+        source: DocumentSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
         content: Vec<ContentBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
     },
 }
 
@@ -138,6 +357,23 @@ impl ContentBlock {
             source: ImageSource::Base64 { media_type: media_type.into(), data: data.into() },
         }
     }
+
+    /// A PDF from base64 data.
+    pub fn pdf_base64(data: impl Into<String>) -> Self {
+        Self::Document {
+            source: DocumentSource::Base64 { media_type: "application/pdf".into(), data: data.into() },
+            title: None,
+        }
+    }
+}
+
+/// Anthropic Messages API document source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DocumentSource {
+    Base64 { media_type: String, data: String },
+    Text { media_type: String, data: String },
+    Url { url: String },
 }
 
 /// Anthropic Messages API image source.
@@ -180,15 +416,20 @@ impl ControlResponse {
 }
 
 /// Answer to a `can_use_tool` request.
-/// Source: query.py:265–281 (`behavior`, `updatedInput`, `message`, `interrupt`)
+/// Source: binary can_use_tool response schema (`behavior`, `updatedInput`,
+/// `updatedPermissions`, `message`, `interrupt`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "behavior", rename_all = "camelCase")]
 pub enum ToolDecision {
     /// `updated_input: None` → the original input is sent back unchanged.
+    /// `updated_permissions`: permission updates to apply, e.g. the
+    /// request's `permission_suggestions` for "always allow".
     #[serde(rename = "allow")]
     Allow {
         #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
         updated_input: Option<serde_json::Value>,
+        #[serde(rename = "updatedPermissions", default, skip_serializing_if = "Option::is_none")]
+        updated_permissions: Option<Vec<serde_json::Value>>,
     },
     #[serde(rename = "deny")]
     Deny {
@@ -199,7 +440,16 @@ pub enum ToolDecision {
 }
 
 impl ToolDecision {
-    pub fn allow() -> Self { Self::Allow { updated_input: None } }
+    pub fn allow() -> Self { Self::Allow { updated_input: None, updated_permissions: None } }
+    /// Allow with a rewritten input.
+    pub fn allow_with_input(input: serde_json::Value) -> Self {
+        Self::Allow { updated_input: Some(input), updated_permissions: None }
+    }
+    /// Allow and apply permission updates, so the CLI stops asking (pass the
+    /// request's `permission_suggestions` for "always allow").
+    pub fn allow_and_remember(updates: Vec<serde_json::Value>) -> Self {
+        Self::Allow { updated_input: None, updated_permissions: Some(updates) }
+    }
     pub fn deny(message: impl Into<String>) -> Self {
         Self::Deny { message: message.into(), interrupt: None }
     }
@@ -326,8 +576,23 @@ pub enum InboundMessage {
     /// Source: chunk-f89nsf5q.query.js:1403–1410
     #[serde(rename = "keep_alive")]
     KeepAlive(KeepAliveMessage),
+    /// The CLI withdrew a control request it sent (e.g. a `can_use_tool`
+    /// whose turn was interrupted); its answer is no longer wanted.
+    #[serde(rename = "control_cancel_request")]
+    ControlCancelRequest(ControlCancelRequest),
+    /// Any other frame type (`rate_limit_event`, `tool_progress`,
+    /// `prompt_suggestion`, `command_lifecycle`, …), kept verbatim.
+    #[serde(skip_deserializing)]
+    Other(serde_json::Value),
+    /// Decoding placeholder; `Session` turns it into `Other`.
     #[serde(other)]
     Unknown,
+}
+
+/// Source: binary control_cancel_request schema
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControlCancelRequest {
+    pub request_id: String,
 }
 
 /// Every `type:"system"` frame: `init` (first frame of each turn) plus
@@ -337,7 +602,7 @@ pub enum InboundMessage {
 /// only `subtype` and `session_id` are common to all; subtype-specific fields
 /// are in `extra`. Source: binary system-message schemas
 /// Source: chunk-hp1k7mph.js:194 (WGt function), chunk-20bv8pca.js:15125
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMessage {
     pub subtype: String, // "init" | "hook_started" | "hook_response" | …
     pub session_id: String,
@@ -400,18 +665,78 @@ pub enum AssistantBlock {
     },
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
+    /// Encrypted thinking; opaque to the host.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
+    /// A tool the API runs itself (web search, …).
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "web_search_tool_result")]
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
     #[serde(other)]
     Unknown,
 }
 
+/// A `user` frame: the echo of a prompt, tool results, or a message the
+/// CLI added itself (`is_synthetic`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct InboundUserMessage {
     #[serde(default)]
     pub uuid: Option<String>,
     #[serde(default, rename = "isReplay")]
     pub is_replay: Option<bool>,
+    #[serde(default, rename = "isSynthetic")]
+    pub is_synthetic: Option<bool>,
     #[serde(default)]
     pub parent_tool_use_id: Option<String>,
+    /// Subagent that produced the frame.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub message: Option<InboundUserBody>,
+    /// The tool's full structured output (e.g. Bash `{stdout, stderr, …}`),
+    /// beside the text sent to the model.
+    #[serde(default)]
+    pub tool_use_result: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InboundUserBody {
+    /// A string or an array of content blocks.
+    #[serde(default)]
+    pub content: serde_json::Value,
+}
+
+/// One `tool_result` block of a `user` frame.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InboundToolResult {
+    pub tool_use_id: String,
+    /// A string or an array of content blocks.
+    #[serde(default)]
+    pub content: serde_json::Value,
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+impl InboundUserMessage {
+    /// The `tool_result` blocks of this frame.
+    pub fn tool_results(&self) -> Vec<InboundToolResult> {
+        let Some(blocks) = self.message.as_ref().and_then(|m| m.content.as_array()) else {
+            return vec![];
+        };
+        blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            .filter_map(|b| serde_json::from_value(b.clone()).ok())
+            .collect()
+    }
 }
 
 /// Partial streaming chunk.
@@ -455,6 +780,25 @@ pub struct ResultMessage {
     pub usage: Option<UsageSummary>,
     #[serde(default)]
     pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub duration_api_ms: Option<u64>,
+    #[serde(default)]
+    pub num_turns: Option<u64>,
+    /// Why the loop ended ("completed", …).
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+    /// Output matching `Initialize::json_schema`.
+    #[serde(default)]
+    pub structured_output: Option<serde_json::Value>,
+    /// Tool calls the permission system denied during the turn.
+    #[serde(default)]
+    pub permission_denials: Vec<serde_json::Value>,
+    /// Per-model token and cost breakdown.
+    #[serde(default, rename = "modelUsage")]
+    pub model_usage: Option<serde_json::Value>,
+    /// The prompts (`UserMessage::uuid`) this turn answered.
+    #[serde(default)]
+    pub user_message_uuids: Vec<String>,
     /// Set when the CLI started the turn itself (e.g. `{"kind":"task-notification"}`
     /// after a background task finished); absent for turns the host prompted.
     #[serde(default)]
@@ -468,6 +812,24 @@ impl ResultMessage {
         self.subtype == "success" && !self.is_error
     }
 
+    /// Whether this turn answered the prompt `uuid`. A prompt the CLI
+    /// refuses up front (e.g. budget spent) gets a result but no echo.
+    pub fn answers(&self, uuid: &str) -> bool {
+        self.user_message_uuids.iter().any(|u| u.eq_ignore_ascii_case(uuid))
+    }
+
+    /// Category of a failed turn.
+    pub fn error_kind(&self) -> TurnErrorKind {
+        match self.subtype.as_str() {
+            "error_during_execution" => TurnErrorKind::Execution,
+            "error_max_turns" => TurnErrorKind::MaxTurns,
+            "error_max_budget_usd" => TurnErrorKind::MaxBudget,
+            "error_max_structured_output_retries" => TurnErrorKind::StructuredOutputRetries,
+            "success" => TurnErrorKind::Api,
+            other => TurnErrorKind::Other(other.to_string()),
+        }
+    }
+
     /// Why the turn failed: for `is_error` the CLI's message; for
     /// `error_*` subtypes the subtype, then its `errors` details.
     pub fn error_message(&self) -> String {
@@ -479,6 +841,28 @@ impl ResultMessage {
             .collect();
         if details.is_empty() { self.subtype.clone() } else { format!("{}: {}", self.subtype, details.join("; ")) }
     }
+}
+
+/// Why a turn failed. Source: binary result error-subtype enum
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnErrorKind {
+    /// `error_during_execution`: includes interrupted turns.
+    Execution,
+    /// `error_max_turns`: `SessionOptions::max_turns` reached.
+    MaxTurns,
+    /// `error_max_budget_usd`: `SessionOptions::max_budget_usd` reached.
+    MaxBudget,
+    /// `error_max_structured_output_retries`.
+    StructuredOutputRetries,
+    /// The API call failed (`is_error` on a `success` result).
+    Api,
+    /// The CLI exited before the turn ended.
+    SessionClosed,
+    /// The prompt was withdrawn before it ran (`Session::cancel_prompt`,
+    /// `Session::interrupt_all`).
+    Cancelled,
+    /// A subtype this SDK does not know.
+    Other(String),
 }
 
 /// Token usage breakdown.
@@ -517,6 +901,13 @@ pub enum ControlRequestBody {
     /// JSON-RPC message for an SDK MCP server. Source: query.py:305–320
     #[serde(rename = "mcp_message")]
     McpMessage(McpMessageRequest),
+    /// An MCP server asks the user for input.
+    #[serde(rename = "elicitation")]
+    Elicitation(ElicitationRequest),
+    /// A tool asks the host to render a blocking dialog; sent only for kinds
+    /// listed in `Initialize::supported_dialog_kinds`.
+    #[serde(rename = "request_user_dialog")]
+    RequestUserDialog(UserDialogRequest),
     /// Future subtypes — answered with an error response.
     #[serde(other)]
     Unsupported,
@@ -529,10 +920,112 @@ pub struct CanUseToolRequest {
     pub input: serde_json::Value,
     #[serde(default)]
     pub tool_use_id: Option<String>,
+    /// Permission updates that would stop the CLI asking again; return them
+    /// with `ToolDecision::allow_and_remember` for "always allow".
     #[serde(default)]
     pub permission_suggestions: Option<Vec<serde_json::Value>>,
+    /// Human-readable reason the CLI asks; may carry ANSI escapes.
     #[serde(default)]
     pub decision_reason: Option<String>,
+    /// Why the ask escalated: "rule", "hook", "safetyCheck", "classifier", …
+    #[serde(default)]
+    pub decision_reason_type: Option<String>,
+    /// MCP server of the tool: `{"name", "source"}`.
+    #[serde(default)]
+    pub mcp_server: Option<serde_json::Value>,
+    /// Path outside the allowed directories that triggered the ask.
+    #[serde(default)]
+    pub blocked_path: Option<String>,
+    #[serde(default)]
+    pub classifier_approvable: Option<bool>,
+    /// Do not offer "always allow" for this ask.
+    #[serde(default)]
+    pub suppress_always_allow_rule: Option<bool>,
+    /// The ask must not be approvable by a single stray keystroke.
+    #[serde(default)]
+    pub default_to_no: Option<bool>,
+    #[serde(default)]
+    pub matched_ask_rule: Option<serde_json::Value>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Subagent that wants to use the tool.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub requires_user_interaction: Option<bool>,
+    /// Fields not named above.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Source: binary elicitation schema
+#[derive(Debug, Clone, Deserialize)]
+pub struct ElicitationRequest {
+    pub mcp_server_name: String,
+    pub message: String,
+    /// "form" or "url".
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub elicitation_id: Option<String>,
+    /// JSON schema of the requested form fields.
+    #[serde(default)]
+    pub requested_schema: Option<serde_json::Value>,
+    /// Top-level keys of `requested_schema.properties`, in the server's order.
+    #[serde(default)]
+    pub property_order: Option<Vec<String>>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Answer to an `elicitation` request. Source: binary elicitation response schema
+#[derive(Debug, Clone, Serialize)]
+pub struct ElicitationResponse {
+    pub action: ElicitationAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ElicitationAction {
+    Accept,
+    Decline,
+    Cancel,
+}
+
+impl ElicitationResponse {
+    pub fn accept(content: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self { action: ElicitationAction::Accept, content: Some(content) }
+    }
+    pub fn decline() -> Self {
+        Self { action: ElicitationAction::Decline, content: None }
+    }
+    pub fn cancel() -> Self {
+        Self { action: ElicitationAction::Cancel, content: None }
+    }
+}
+
+/// Source: binary request_user_dialog schema
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserDialogRequest {
+    pub dialog_kind: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -631,12 +1124,34 @@ pub struct KeepAliveMessage {
 
 // ─── Tool/Hook types ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
+    /// Display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// JSON schema of `ToolResult::structured`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
+}
+
+/// MCP tool hints. Source: MCP 2025-06-18 `ToolAnnotations`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

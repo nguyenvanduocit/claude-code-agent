@@ -2,21 +2,25 @@
 //!
 //!   - at most `max_sessions` sessions are checked out at once (semaphore)
 //!   - every session uses `PoolConfig::options` (hooks, MCP servers, model, …)
-//!   - a returned session is reset with `/clear` before it is handed out
-//!     again, so one task never sees another task's conversation
+//!   - `acquire_with(Checkout { model, effort, permission_mode })` hands out
+//!     a session with its own model, effort or permission mode; `None`
+//!     keeps the pool's value
+//!   - a returned session is reset before it is handed out again: `/clear`
+//!     empties the conversation, and model, effort and permission mode are
+//!     set for the next checkout, so a task may change them for itself
+//!     (`set_model`, `set_effort`, `set_permission_mode`) without affecting
+//!     the next one
 //!   - dead sessions are dropped and replaced by a fresh spawn
 //!   - a session returned while its turn is still running is not reused;
 //!     it ends once its last handle is dropped (until then it runs outside
 //!     the `max_sessions` count)
-//!   - model and permission mode changed with `set_model` /
-//!     `set_permission_mode` stay with the session across reuse
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
 
 use crate::agent::{Agent, AgentEvent};
-use crate::protocol::Initialize;
+use crate::protocol::{Effort, Initialize, PermissionMode};
 use crate::session::{Result, Session, SessionError, SessionOptions};
 
 #[derive(Debug, Clone)]
@@ -29,6 +33,27 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self { max_sessions: 4, options: SessionOptions::default() }
+    }
+}
+
+/// Settings for one checkout. `None` keeps the value from
+/// `PoolConfig::options`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Checkout {
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub permission_mode: Option<PermissionMode>,
+}
+
+impl Checkout {
+    /// The pool's options with this checkout's settings applied.
+    fn options(&self, base: &SessionOptions) -> SessionOptions {
+        SessionOptions {
+            model: self.model.clone().or_else(|| base.model.clone()),
+            effort: self.effort.or(base.effort),
+            permission_mode: self.permission_mode.or(base.permission_mode),
+            ..base.clone()
+        }
     }
 }
 
@@ -87,13 +112,21 @@ impl SessionPool {
         warmed
     }
 
-    /// Check out a session with an empty conversation; waits while
-    /// `max_sessions` are checked out.
+    /// Check out a session with an empty conversation and the pool's
+    /// settings; waits while `max_sessions` are checked out.
     pub async fn acquire(&self) -> Result<PooledSession> {
+        self.acquire_with(Checkout::default()).await
+    }
+
+    /// Check out a session with an empty conversation and `checkout`'s
+    /// model, effort and permission mode; waits while `max_sessions` are
+    /// checked out.
+    pub async fn acquire_with(&self, checkout: Checkout) -> Result<PooledSession> {
         let permit = Arc::clone(&self.0.semaphore)
             .acquire_owned()
             .await
             .map_err(|_| SessionError::Closed)?;
+        let options = checkout.options(&self.0.config.options);
 
         loop {
             let next = self.idle().pop();
@@ -101,14 +134,21 @@ impl SessionPool {
             if !session.is_alive() {
                 continue;
             }
-            if used && clear(&session).await.is_err() {
+            // An unused session already runs the pool's settings.
+            let prepared = match (used, checkout == Checkout::default()) {
+                (false, true) => Ok(()),
+                (false, false) => apply(&session, &options).await,
+                (true, _) => reset(&session, &options).await,
+            };
+            if let Err(e) = prepared {
+                tracing::warn!(error = %e, "pooled session reset failed; replacing it");
                 session.close().await;
                 continue;
             }
             return Ok(PooledSession { session, pool: self.clone(), _permit: permit });
         }
 
-        let session = Session::spawn(self.0.config.options.clone(), Initialize::default()).await?;
+        let session = Session::spawn(options, Initialize::default()).await?;
         Ok(PooledSession { session, pool: self.clone(), _permit: permit })
     }
 
@@ -117,24 +157,34 @@ impl SessionPool {
     }
 }
 
-/// `/clear` makes no API call; anything slower means a stuck CLI.
-const CLEAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// A reset makes no API call; anything slower means a stuck CLI.
+const RESET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Reset the conversation: `/clear` runs locally in the CLI (no API call)
-/// and starts a new session id.
-async fn clear(session: &Session) -> std::result::Result<(), String> {
+/// Reset a used session for the next task: `/clear` the conversation (runs
+/// locally in the CLI, no API call, new session id), then set the next
+/// checkout's model, effort and permission mode.
+async fn reset(session: &Session, options: &SessionOptions) -> std::result::Result<(), String> {
     let run = async {
         let mut stream = Agent::new(session.clone()).prompt("/clear").await.map_err(|e| e.to_string())?;
-        while let Some(ev) = stream.next().await {
-            match ev {
-                AgentEvent::Done(_) => return Ok(()),
-                AgentEvent::Error(e) => return Err(e),
-                _ => {}
+        loop {
+            match stream.next().await {
+                Some(AgentEvent::Done(_)) => break,
+                Some(AgentEvent::Error(e)) => return Err(e.to_string()),
+                Some(_) => {}
+                None => return Err("stream ended without a result".to_string()),
             }
         }
-        Err("stream ended without a result".to_string())
+        apply(session, options).await
     };
-    tokio::time::timeout(CLEAR_TIMEOUT, run).await.unwrap_or_else(|_| Err("/clear timed out".into()))
+    tokio::time::timeout(RESET_TIMEOUT, run).await.unwrap_or_else(|_| Err("reset timed out".into()))
+}
+
+/// Set model, effort and permission mode from `options` on a live session.
+async fn apply(session: &Session, options: &SessionOptions) -> std::result::Result<(), String> {
+    session.set_model(options.model.as_deref()).await.map_err(|e| e.to_string())?;
+    session.set_effort(options.effort).await.map_err(|e| e.to_string())?;
+    let mode = options.permission_mode.unwrap_or(PermissionMode::Default);
+    session.set_permission_mode(mode).await.map_err(|e| e.to_string())
 }
 
 /// A session borrowed from the pool. Returns to the pool on Drop. Keep

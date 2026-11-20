@@ -153,6 +153,7 @@ fn impl_claude_tool(func: ItemFn) -> TokenStream2 {
                 name: #name_str.into(),
                 description: #description.into(),
                 input_schema: ::core::option::Option::Some(#schema_ts),
+                ..::core::default::Default::default()
             }
         }
 
