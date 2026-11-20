@@ -142,7 +142,7 @@ pub use protocol::{
     BackgroundTask, TurnErrorKind,
     // Control
     ToolDecision, HookOutput, HookDecision, ControlRequest, ControlRequestBody,
-    ControlResponse, CanUseToolRequest, ElicitationRequest, ElicitationResponse, UserDialogRequest,
+    ControlResponse, CanUseToolRequest, ElicitationRequest, ElicitationResponse, UserDialogBehavior, UserDialogRequest, UserDialogResponse,
     // Hook types
     HookEventKind, HookEventPayload, HookCallbackRequest,
     // Tools/MCP

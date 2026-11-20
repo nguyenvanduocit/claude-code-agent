@@ -34,7 +34,7 @@ use crate::protocol::{
     ElicitationRequest, ElicitationResponse, InboundControlResponseBody, InboundMessage, Initialize,
     OutboundControlRequest, PermissionMode, PermissionPrompts, ResultMessage, Thinking, ThinkingDisplay,
     ToolDecision,
-    UserDialogRequest,
+    UserDialogRequest, UserDialogResponse,
 };
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -110,10 +110,12 @@ impl OnElicitation {
     }
 }
 
-type DialogFuture = Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'static>>;
+type DialogFuture = Pin<Box<dyn Future<Output = UserDialogResponse> + Send + 'static>>;
 
-/// Renders `request_user_dialog` dialogs and returns the user's choice.
-/// List the kinds it handles in `Initialize::supported_dialog_kinds`.
+/// Renders `request_user_dialog` dialogs and returns the user's choice,
+/// e.g. `UserDialogResponse::completed("retry_fallback")` for a
+/// `refusal_fallback_prompt`. List the kinds it handles in
+/// `Initialize::supported_dialog_kinds`; the CLI sends no other kind.
 #[derive(Clone)]
 pub struct OnUserDialog(Arc<dyn Fn(UserDialogRequest) -> DialogFuture + Send + Sync>);
 
@@ -121,7 +123,7 @@ impl OnUserDialog {
     pub fn new<F, Fut>(f: F) -> Self
     where
         F: Fn(UserDialogRequest) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = serde_json::Value> + Send + 'static,
+        Fut: Future<Output = UserDialogResponse> + Send + 'static,
     {
         Self(Arc::new(move |req| Box::pin(f(req))))
     }
@@ -1545,7 +1547,10 @@ impl Responder {
                 None => ControlResponse::error(&req.request_id, "no on_elicitation handler"),
             },
             ControlRequestBody::RequestUserDialog(d) => match &self.on_user_dialog {
-                Some(handler) => ControlResponse::success(&req.request_id, (handler.0)(d).await),
+                Some(handler) => match serde_json::to_value((handler.0)(d).await) {
+                    Ok(v) => ControlResponse::success(&req.request_id, v),
+                    Err(e) => ControlResponse::error(&req.request_id, e.to_string()),
+                },
                 None => ControlResponse::error(&req.request_id, "no on_user_dialog handler"),
             },
             ControlRequestBody::Unsupported => {

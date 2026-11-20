@@ -1,6 +1,6 @@
 [package]
 name = "claude-sdk"
-version = "0.4.0"
+version = "0.5.0"
 rust-version = "1.88"
 edition = "2024"
 description = "Rust SDK for Claude Code — persistent subprocess, hook callbacks, in-process tools, record/replay"
@@ -25,7 +25,7 @@ thiserror    = "2"
 tracing      = "0.1"
 dashmap      = "6"
 
-claude-sdk-macros      = { version = "0.4.0", path = "claude-sdk-macros", optional = true }
+claude-sdk-macros      = { version = "0.5.0", path = "claude-sdk-macros", optional = true }
 
 tokio-stream = "0.1.19"
 async-stream = "0.3.6"
@@ -40,7 +40,7 @@ tokio             = { version = "1", features = ["full"] }
 tokio-stream      = "0.1.19"
 anyhow            = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-claude-sdk-macros = { version = "0.4.0", path = "claude-sdk-macros" }
+claude-sdk-macros = { version = "0.5.0", path = "claude-sdk-macros" }
 
 [[example]]
 name = "tools"

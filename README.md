@@ -17,7 +17,7 @@ Rust SDK for [Claude Code](https://claude.ai/claude-code). It drives the `claude
 Pin the git dependency to a commit or tag:
 
 ```toml
-claude-sdk = { git = "https://github.com/nguyenvanduocit/claude-sdk-rs", tag = "v0.4.0", features = ["macros"] }
+claude-sdk = { git = "https://github.com/nguyenvanduocit/claude-sdk-rs", tag = "v0.5.0", features = ["macros"] }
 ```
 
 ## Quick start
@@ -203,15 +203,42 @@ Experimental and unsupported by Anthropic: Code Mode is gated server-side, and t
 
 `PreToolUse` · `PostToolUse` · `PostToolUseFailure` · `PostToolBatch` · `UserPromptSubmit` · `UserPromptExpansion` · `SessionStart` · `SessionEnd` · `Stop` · `StopFailure` · `SubagentStart` · `SubagentStop` · `PreCompact` · `PostCompact` · `PreModelSwitch` · `PostModelSwitch` · `PermissionRequest` · `PermissionDenied` · `Setup` · `TeammateIdle` · `TaskCreated` · `TaskCompleted` · `Elicitation` · `ElicitationResult` · `ConfigChange` · `WorktreeCreate` · `WorktreeRemove` · `InstructionsLoaded` · `CwdChanged` · `FileChanged` · `DirectoryAdded` · `MessageDisplay` · `Notification`
 
+## User dialogs
+
+Some CLI flows stop and ask the host app a question (`request_user_dialog`). Declare the kinds your app renders and answer from `on_user_dialog`; the CLI sends no other kind.
+
+```rust
+let opts = SessionOptions {
+    on_user_dialog: Some(OnUserDialog::new(|d| async move {
+        match d.dialog_kind.as_str() {
+            "auto_mode_server_fallback" => UserDialogResponse::completed("continue"),
+            _ => UserDialogResponse::cancelled(),
+        }
+    })),
+    ..Default::default()
+};
+let init = Initialize { supported_dialog_kinds: Some(vec!["auto_mode_server_fallback".into()]), ..Default::default() };
+```
+
+CLI 2.1.329 sends these kinds to an SDK host:
+
+| Kind | When | Answers |
+|---|---|---|
+| `auto_mode_server_fallback` | auto mode falls back to billed classifier requests (e.g. API key behind a gateway) | `"continue"`, `"interrupt"` |
+| `refusal_fallback_prompt` | a model refuses and a fallback model is available | `"retry_fallback"`, `"edit_prompt"` |
+| `fable_overage_consent_prompt` | usage reaches the plan's overage limit | per payload |
+| `enum_prompt` | a CLI flow asks for one choice from a list | per payload |
+| `send_to_project_remote_control_offer` | sending to a project needs Remote Control | per payload |
+
+`cancelled()` means the user dismissed the dialog; the CLI applies the dialog's default. Verified live for `auto_mode_server_fallback`: `"continue"` runs the classifier, `"interrupt"` and `cancelled()` reject the tool call and end the turn.
+
 ## Limitations
 
 - `code_mode` runs a patched copy of the CLI. The patch anchors on minified code, so a CLI release that changes the Code Mode module makes spawn fail with `CodeModeError::Anchor` until the anchors are updated. Verified on 2.1.329.
 - Tools of servers added with `set_mcp_servers` are not pre-allowed: the permission mode and `can_use_tool` decide.
 - `mcp_call` and `mcp_read_resource` reach external MCP servers only; the CLI refuses in-process ones.
-- `on_user_dialog` (`request_user_dialog`) is wired but untested: no tool in 2.1.329 sent one in our runs.
 - `set_system_prompt` works only while the session runs the account's default model (CLI 2.1.329 cannot confirm another); `set_model_and_system_prompt` works always.
 - `UserMessage::with_timestamp` is sent, but CLI 2.1.329 records its own receive time.
-- Windows process-tree cleanup (`taskkill /T`) is covered by `tests/process_tree.rs` in CI's `windows-latest` job; local runs were on macOS.
 - No credential handling: the CLI uses its own login.
 
 ## License

@@ -1028,6 +1028,34 @@ pub struct UserDialogRequest {
     pub tool_use_id: Option<String>,
 }
 
+/// The user's answer to a `request_user_dialog`.
+/// Source: binary request_user_dialog response schema (behavior, result)
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UserDialogResponse {
+    pub behavior: UserDialogBehavior,
+    /// Dialog-specific choice, e.g. `"retry_fallback"` for
+    /// `refusal_fallback_prompt`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UserDialogBehavior {
+    Completed,
+    /// The user dismissed the dialog.
+    Cancelled,
+}
+
+impl UserDialogResponse {
+    pub fn completed(result: impl Into<serde_json::Value>) -> Self {
+        Self { behavior: UserDialogBehavior::Completed, result: Some(result.into()) }
+    }
+    pub fn cancelled() -> Self {
+        Self { behavior: UserDialogBehavior::Cancelled, result: None }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpMessageRequest {
     pub server_name: String,
